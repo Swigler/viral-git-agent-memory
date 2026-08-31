@@ -37,6 +37,7 @@ Usage:
     # Test with a fake transcript:
     python memory_hook.py --test /path/to/repo
 """
+import fcntl
 import json
 import os
 import re
@@ -389,26 +390,40 @@ def _safe_slug(slug: str) -> str:
     return safe[:80]
 
 
-def write_memory_file(repo_path: str, memory_type: str, slug: str, fact: str, episode: str):
-    """Create or overwrite a memory .md file."""
+def write_memory_file(repo_path: str, memory_type: str, slug: str, fact: str, episode: str,
+                      seen_slugs: set | None = None):
+    """Create a new memory .md file. If slug collides (on disk or in batch), suffix it."""
     mem_dir = Path(repo_path) / memory_type
     mem_dir.mkdir(exist_ok=True)
     slug = _safe_slug(slug)
 
     today = date.today().strftime("%d.%m.%y")
-    filepath = mem_dir / f"{slug}.md"
 
-    if filepath.exists():
-        # Append to access log
-        content = filepath.read_text(encoding="utf-8")
-        content += f"\nused, {today}"
-        filepath.write_text(content, encoding="utf-8")
-    else:
-        content = f"# {slug.replace('-', ' ').title()}\n\n"
-        content += f"## Fact\n{fact}\n\n"
-        content += f"## Episode\n{episode}\n\n"
-        content += f"## Access log\nused, {today}\n"
-        filepath.write_text(content, encoding="utf-8")
+    # Resolve collisions: on-disk or intra-batch
+    base_slug = slug
+    counter = 2
+    while True:
+        filepath = mem_dir / f"{slug}.md"
+        in_batch = seen_slugs is not None and slug in seen_slugs
+        if not filepath.exists() and not in_batch:
+            break
+        slug = f"{base_slug}-{counter}"
+        counter += 1
+        if counter > 50:  # safety valve
+            slug = f"{base_slug}-{date.today().strftime('%Y%m%d%H%M%S')}"
+            break
+    if slug != base_slug:
+        _log(f"[write] slug collision: {base_slug} → {slug}")
+
+    if seen_slugs is not None:
+        seen_slugs.add(slug)
+
+    filepath = mem_dir / f"{slug}.md"
+    content = f"# {slug.replace('-', ' ').title()}\n\n"
+    content += f"## Fact\n{fact}\n\n"
+    content += f"## Episode\n{episode}\n\n"
+    content += f"## Access log\nused, {today}\n"
+    filepath.write_text(content, encoding="utf-8")
 
 
 def update_memory_file(repo_path: str, memory_type: str, slug: str, fact: str, episode: str):
@@ -432,6 +447,7 @@ def update_memory_file(repo_path: str, memory_type: str, slug: str, fact: str, e
         new_content += access_log.rstrip() + f"\nused, {today}\n"
         filepath.write_text(new_content, encoding="utf-8")
     else:
+        _log(f"[warn] UPDATE target '{slug}' not found on disk — creating as new file")
         write_memory_file(repo_path, memory_type, slug, fact, episode)
 
 
@@ -442,17 +458,34 @@ def mark_contradicted(repo_path: str, memory_type: str, slug: str):
     filepath = mem_dir / f"{slug}.md"
     today = date.today().strftime("%d.%m.%y")
 
-    if filepath.exists():
-        content = filepath.read_text(encoding="utf-8")
-        if "## Contradicted" not in content:
-            content += f"\n## Contradicted\nMarked contradicted on {today}\n"
-            filepath.write_text(content, encoding="utf-8")
+    if not filepath.exists():
+        _log(f"[warn] DELETE target '{slug}' not found on disk — skipping contradiction mark")
+        return
+
+    content = filepath.read_text(encoding="utf-8")
+    if "## Contradicted" not in content:
+        content += f"\n## Contradicted\nMarked contradicted on {today}\n"
+        filepath.write_text(content, encoding="utf-8")
+
+
+def _count_used_stamps(content: str) -> int:
+    """Count 'used,' lines only in the Access log section, not in fact/episode text."""
+    log_marker = "## Access log"
+    log_idx = content.find(log_marker)
+    if log_idx == -1:
+        return 0
+    log_section = content[log_idx:]
+    # Stop at next section if any
+    next_section = re.search(r"\n## (?!Access log)", log_section)
+    if next_section:
+        log_section = log_section[:next_section.start()]
+    return sum(1 for line in log_section.splitlines() if line.strip().startswith("used,"))
 
 
 def _use_count_and_recency(filepath: Path) -> tuple[int, float]:
     """Return (use_count, last_mod_time) for sorting: most used first, recency as tiebreaker."""
     content = filepath.read_text(encoding="utf-8")
-    count = content.count("used,")
+    count = _count_used_stamps(content)
     return (count, filepath.stat().st_mtime)
 
 
@@ -471,7 +504,7 @@ def rebuild_index(repo_path: str, memory_type: str):
 
     for i, f in enumerate(files, 1):
         content = f.read_text(encoding="utf-8")
-        use_count = content.count("used,")
+        use_count = _count_used_stamps(content)
         fact_match = re.search(r"## Fact\n(.+?)(\n\n|\n##|$)", content, re.DOTALL)
         summary = fact_match.group(1).strip()[:100] if fact_match else f.stem
         contradicted = " ⚠️ CONTRADICTED" if "## Contradicted" in content else ""
@@ -516,10 +549,38 @@ def git_commit(repo_path: str):
                 err_msg = re.sub(r'https://[^@]+@', 'https://***@', push.stderr.strip()[:100])
                 _log(f"[git] push failed: {err_msg}")
     else:
-        _log(f"[git] nothing to commit or error: {result.stderr.strip()[:100]}")
+        stderr = result.stderr.strip()
+        if "nothing to commit" in stderr or "working tree clean" in stderr:
+            _log("[git] nothing to commit")
+        else:
+            # Real error: disk full, identity misconfigured, index locked, etc.
+            _log(f"[git] COMMIT FAILED (rc={result.returncode}): {stderr[:200]}")
 
 
 # --- Main Consolidation Flow ---
+
+
+class _UserLock:
+    """Per-user file lock to prevent concurrent consolidations racing on .md files and git."""
+
+    def __init__(self, repo_path: str):
+        self._lockfile = Path(repo_path) / ".consolidation.lock"
+        self._fd = None
+
+    def __enter__(self):
+        self._fd = open(self._lockfile, "w")
+        try:
+            fcntl.flock(self._fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except OSError:
+            _log("[lock] another consolidation is running for this user — waiting...")
+            fcntl.flock(self._fd, fcntl.LOCK_EX)  # block until available
+        return self
+
+    def __exit__(self, *exc):
+        if self._fd:
+            fcntl.flock(self._fd, fcntl.LOCK_UN)
+            self._fd.close()
+        return False
 
 
 def consolidate(repo_path: str, transcript: str):
@@ -531,7 +592,15 @@ def consolidate(repo_path: str, transcript: str):
     4. Write/update memory files
     5. Rebuild indexes
     Git add/commit runs at the end.
+
+    Uses a per-user file lock to prevent concurrent consolidations from racing.
     """
+    with _UserLock(repo_path):
+        _consolidate_inner(repo_path, transcript)
+
+
+def _consolidate_inner(repo_path: str, transcript: str):
+    """Inner consolidation logic, called under lock."""
     today = date.today().strftime("%d.%m.%y")
 
     # --- Step 1: User fact extraction ---
@@ -556,6 +625,7 @@ def consolidate(repo_path: str, transcript: str):
         raw = call_llm(prompt, "Decide what to do with each new fact.")
         decisions = parse_json(raw).get("decisions", [])
 
+        seen_slugs: set[str] = set()
         for d in decisions:
             action = d.get("action", "").upper()
             slug = d.get("slug", "")
@@ -563,7 +633,7 @@ def consolidate(repo_path: str, transcript: str):
             episode = d.get("episode", f"Session {today}")
 
             if action == "ADD" and slug:
-                write_memory_file(repo_path, "user_memory", slug, fact, episode)
+                write_memory_file(repo_path, "user_memory", slug, fact, episode, seen_slugs)
                 _log(f"[user] ADD: {slug}")
             elif action == "UPDATE" and d.get("target_slug"):
                 target = _safe_slug(d["target_slug"])
@@ -593,6 +663,7 @@ def consolidate(repo_path: str, transcript: str):
         raw = call_llm(prompt, "Decide what to do with each new fact.")
         decisions = parse_json(raw).get("decisions", [])
 
+        seen_slugs: set[str] = set()
         for d in decisions:
             action = d.get("action", "").upper()
             slug = d.get("slug", "")
@@ -600,7 +671,7 @@ def consolidate(repo_path: str, transcript: str):
             episode = d.get("episode", f"Session {today}")
 
             if action == "ADD" and slug:
-                write_memory_file(repo_path, "character_memory", slug, fact, episode)
+                write_memory_file(repo_path, "character_memory", slug, fact, episode, seen_slugs)
                 _log(f"[agent] ADD: {slug}")
             elif action == "UPDATE" and d.get("target_slug"):
                 target = _safe_slug(d["target_slug"])

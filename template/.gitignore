@@ -1,4 +1,5 @@
 .transcript_*.jsonl
 .consolidation.log
+.consolidation.lock
 .git_credentials.json
 __pycache__/
