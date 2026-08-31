@@ -1,0 +1,4 @@
+.transcript_*.jsonl
+.consolidation.log
+.git_credentials.json
+__pycache__/
