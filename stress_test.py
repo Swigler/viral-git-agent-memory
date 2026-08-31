@@ -87,12 +87,33 @@ def test_write_memory_file():
     check("has used stamp", "used," in content)
     check("fact correct", "You love pizza." in content)
 
-    # Write again — should append used stamp, not overwrite
-    mh.write_memory_file(REPO, "user_memory", "likes-pizza", "ignored", "ignored")
-    content2 = f.read_text()
-    use_count = content2.count("used,")
-    check("second write appends used stamp", use_count == 2, f"got {use_count} stamps")
-    check("original fact preserved", "You love pizza." in content2)
+    # Write again with same slug — should create likes-pizza-2.md (collision handling)
+    mh.write_memory_file(REPO, "user_memory", "likes-pizza", "You also love pasta.", "Session 31.08.26")
+    f2 = Path(REPO) / "user_memory" / "likes-pizza-2.md"
+    check("slug collision creates suffixed file", f2.is_file())
+    check("original file unchanged", "You love pizza." in f.read_text())
+    check("new file has new fact", "You also love pasta." in f2.read_text())
+
+
+def test_intra_batch_dedup():
+    """Test that seen_slugs prevents intra-batch clobbering."""
+    print("\n--- TEST 2b: intra-batch dedup ---")
+
+    seen = set()
+    mh.write_memory_file(REPO, "user_memory", "batch-test", "First fact", "Ep1", seen)
+    mh.write_memory_file(REPO, "user_memory", "batch-test", "Second fact", "Ep2", seen)
+    mh.write_memory_file(REPO, "user_memory", "batch-test", "Third fact", "Ep3", seen)
+
+    f1 = Path(REPO) / "user_memory" / "batch-test.md"
+    f2 = Path(REPO) / "user_memory" / "batch-test-2.md"
+    f3 = Path(REPO) / "user_memory" / "batch-test-3.md"
+
+    check("batch file 1 created", f1.is_file())
+    check("batch file 2 created (dedup)", f2.is_file())
+    check("batch file 3 created (dedup)", f3.is_file())
+    check("file 1 has first fact", "First fact" in f1.read_text())
+    check("file 2 has second fact", "Second fact" in f2.read_text())
+    check("file 3 has third fact", "Third fact" in f3.read_text())
 
 
 def test_update_memory_file():
@@ -125,6 +146,40 @@ def test_mark_contradicted():
     check("no duplicate contradicted marker", count == 1, f"got {count}")
 
 
+def test_missing_target_logging():
+    """Test that UPDATE/DELETE on missing targets don't silently no-op."""
+    print("\n--- TEST 4b: missing target handling ---")
+
+    # DELETE on non-existent slug should not crash
+    mh.mark_contradicted(REPO, "user_memory", "totally-fake-slug")
+    check("DELETE on missing slug doesn't crash", True)
+    f = Path(REPO) / "user_memory" / "totally-fake-slug.md"
+    check("DELETE on missing slug doesn't create file", not f.is_file())
+
+    # UPDATE on non-existent slug should create new file (fallback)
+    mh.update_memory_file(REPO, "user_memory", "also-fake", "Fallback fact", "Fallback episode")
+    f2 = Path(REPO) / "user_memory" / "also-fake.md"
+    check("UPDATE on missing slug creates fallback file", f2.is_file())
+    check("fallback file has correct fact", "Fallback fact" in f2.read_text())
+
+
+def test_used_count_accuracy():
+    """Test that 'used,' counting only counts Access log lines, not text in fact/episode."""
+    print("\n--- TEST 4c: used-count accuracy ---")
+
+    # Create a memory with 'used,' appearing in the fact text (should NOT be counted)
+    mem_dir = Path(REPO) / "user_memory"
+    tricky = mem_dir / "tricky-count.md"
+    tricky.write_text(
+        "# Tricky Count\n\n"
+        "## Fact\nHe used, this tool and used, it well.\n\n"
+        "## Episode\nSession used, yesterday\n\n"
+        "## Access log\nused, 29.08.26\nused, 30.08.26\nused, 31.08.26\n"
+    )
+    count = mh._count_used_stamps(tricky.read_text())
+    check("used-count ignores fact/episode text", count == 3, f"got {count}, expected 3")
+
+
 def test_use_count_ranking():
     """Test that ranking sorts by use count, not mod time."""
     print("\n--- TEST 5: use_count_ranking ---")
@@ -152,15 +207,15 @@ def test_use_count_ranking():
     mh.rebuild_index(REPO, "user_memory")
     index = (Path(REPO) / "user_memory.md").read_text()
 
-    lines = [l for l in index.split("\n") if l.startswith(("1.", "2.", "3."))]
-    # common-fact (5 uses) should be above medium-fact (3 uses) should be above rare-fact (1 use)
-    common_pos = next((i for i, l in enumerate(lines) if "common-fact" in l), -1)
-    medium_pos = next((i for i, l in enumerate(lines) if "medium-fact" in l), -1)
-    rare_pos = next((i for i, l in enumerate(lines) if "rare-fact" in l), -1)
+    # Find positions of our three test facts among ALL numbered lines
+    numbered_lines = [l for l in index.split("\n") if l and l[0].isdigit() and "." in l[:4]]
+    common_pos = next((i for i, l in enumerate(numbered_lines) if "common-fact" in l), -1)
+    medium_pos = next((i for i, l in enumerate(numbered_lines) if "medium-fact" in l), -1)
+    rare_pos = next((i for i, l in enumerate(numbered_lines) if "rare-fact" in l), -1)
 
     check("common-fact ranked highest (5 uses)", common_pos != -1 and common_pos < medium_pos,
           f"positions: common={common_pos}, medium={medium_pos}, rare={rare_pos}")
-    check("medium-fact ranked middle (3 uses)", medium_pos != -1 and medium_pos < rare_pos,
+    check("medium-fact ranked middle (3 uses)", medium_pos != -1 and rare_pos != -1 and medium_pos < rare_pos,
           f"positions: common={common_pos}, medium={medium_pos}, rare={rare_pos}")
     check("index shows use counts", "(used 5x)" in index, f"index:\n{index[:300]}")
 
@@ -373,8 +428,11 @@ def main():
     try:
         test_init_repo()
         test_write_memory_file()
+        test_intra_batch_dedup()
         test_update_memory_file()
         test_mark_contradicted()
+        test_missing_target_logging()
+        test_used_count_accuracy()
         test_use_count_ranking()
         test_rebuild_index_contradicted()
         test_git_commit()

@@ -91,17 +91,37 @@ Each user gets their own repo:
 
 ## Status
 
-This project is **built and code-reviewed but not yet production-tested or personally tested with real conversations**. The architecture is solid, the code has been through multiple security review passes, but it hasn't been battle-tested with real users yet. Expect rough edges.
+This project is **built and code-reviewed but not yet production-tested or personally tested with real conversations**. The architecture is solid, the code has been through multiple review passes and has a 58-assertion test suite covering every code path, but it hasn't been battle-tested with real users yet. Expect rough edges.
 
-You can tell your AI agent to run the built-in smoke test:
+### Tests
 
 ```bash
-# Run the consolidation test with a fake conversation
+# Offline test suite — 58 assertions, no API key needed
+python stress_test.py
+
+# Full test with live LLM (runs extraction + AUDN on a fake conversation)
+MEMORY_LLM_PROVIDER=ollama python stress_test.py
+
+# Smoke test — creates a repo, runs one consolidation, inspect the output
 MEMORY_LLM_PROVIDER=openai OPENAI_API_KEY=sk-xxx \
 python memory_hook.py --test /tmp/test_repo
 ```
 
-This creates a test repo, runs extraction + AUDN on a sample conversation, and writes memory files so you can inspect the output.
+Example test output (offline, no LLM):
+```
+  ✅ user_memory/ exists
+  ✅ file created
+  ✅ slug collision creates suffixed file
+  ✅ batch file 2 created (dedup)
+  ✅ fact updated
+  ✅ contradicted marker added
+  ✅ DELETE on missing slug doesn't crash
+  ✅ used-count ignores fact/episode text
+  ✅ common-fact ranked highest (5 uses)
+  ✅ new commit created
+  ✅ memory survives re-init
+  RESULTS: 58 passed, 0 failed
+```
 
 ## Quick Start
 
@@ -233,6 +253,14 @@ used, 02.09.26
 ```
 
 Memories are **never deleted** — unused ones sink to the bottom of the index. When a buried topic resurfaces, it jumps back to the top. The `used` stamps drive the ranking: most-used memories load into context first.
+
+## Concurrency & Reliability
+
+- **Per-user file locking** — `fcntl.flock` prevents concurrent consolidations from racing on `.md` files and git operations
+- **Slug collision handling** — if an ADD generates a slug that already exists on disk (or duplicates within the same batch), it auto-suffixes (`likes-coffee-2`, `likes-coffee-3`)
+- **Missing target warnings** — UPDATE/DELETE on a slug that doesn't exist on disk logs a `[warn]` instead of silently no-oping
+- **Git error detection** — distinguishes "nothing to commit" from real failures (disk full, identity misconfigured, index locked)
+- **Contradiction tracking** — the DELETE action marks memories as contradicted (they sink in ranking but are never destroyed, so `git revert` always works)
 
 ## Security
 
