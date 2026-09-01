@@ -281,6 +281,10 @@ The same system works for any agent type — just change `character.md`:
 | Code helper | "Python dev, show diffs not full files" |
 | Tutor | "Visual learner, needs examples first" |
 
+## Used By
+
+- [oracle-cloud-ai-agent](https://github.com/Swigler/oracle-cloud-ai-agent) — Voice AI assistant on Oracle Cloud free tier. Uses viral-git-agent-memory for persistent conversation memory.
+
 ## License
 
 MIT
