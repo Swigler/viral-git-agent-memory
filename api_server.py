@@ -177,7 +177,18 @@ def load_top_memories(repo: Path, memory_type: str, n: int = TOP_N_MEMORIES) -> 
 
     def _use_count_and_recency(filepath: Path) -> tuple[int, float]:
         content = filepath.read_text(encoding="utf-8")
-        return (content.count("used,"), filepath.stat().st_mtime)
+        # Only count 'used,' lines in the Access log section, not in fact/episode text
+        log_marker = "## Access log"
+        log_idx = content.find(log_marker)
+        count = 0
+        if log_idx != -1:
+            log_section = content[log_idx:]
+            # Stop at next section if any
+            next_section = re.search(r"\n## (?!Access log)", log_section)
+            if next_section:
+                log_section = log_section[:next_section.start()]
+            count = sum(1 for line in log_section.splitlines() if line.strip().startswith("used,"))
+        return (count, filepath.stat().st_mtime)
 
     files = sorted(mem_dir.glob("*.md"), key=_use_count_and_recency, reverse=True)
     parts = []
