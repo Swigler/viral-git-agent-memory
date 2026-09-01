@@ -324,6 +324,54 @@ def test_audn_replace():
     check("no Python .format() braces", "{existing}" not in prompt)
 
 
+def test_pinned_memories():
+    """Test that pinned memories sort above unpinned regardless of use count."""
+    print("\n--- TEST 11b: pinned memories ---")
+
+    import time
+
+    # Create a high-use unpinned memory
+    mh.write_memory_file(REPO, "user_memory", "high-use-unpinned", "You drink tea.", "Session 01.09.26")
+    f = Path(REPO) / "user_memory" / "high-use-unpinned.md"
+    for _ in range(10):
+        f.write_text(f.read_text() + "\nused, 01.09.26")
+    time.sleep(0.05)
+
+    # Create a low-use pinned memory
+    mh.write_memory_file(REPO, "user_memory", "peanut-allergy", "You are severely allergic to peanuts.", "Session 01.09.26", pinned=True)
+    time.sleep(0.05)
+
+    # Create another unpinned memory
+    mh.write_memory_file(REPO, "user_memory", "low-use-unpinned", "You like blue.", "Session 01.09.26")
+
+    mh.rebuild_index(REPO, "user_memory")
+    index = (Path(REPO) / "user_memory.md").read_text()
+
+    numbered_lines = [l for l in index.split("\n") if l and l[0].isdigit() and "." in l[:4]]
+    pinned_pos = next((i for i, l in enumerate(numbered_lines) if "peanut-allergy" in l), -1)
+    high_use_pos = next((i for i, l in enumerate(numbered_lines) if "high-use-unpinned" in l), -1)
+
+    check("pinned memory ranks above high-use unpinned", pinned_pos < high_use_pos,
+          f"pinned={pinned_pos}, high_use={high_use_pos}")
+    check("pinned badge in index", "PINNED" in index)
+
+    # Test auto-pinning via should_pin()
+    mh.write_memory_file(REPO, "user_memory", "auto-pin-test", "You take insulin daily for diabetes.", "Session 01.09.26")
+    auto_content = (Path(REPO) / "user_memory" / "auto-pin-test.md").read_text()
+    check("auto-pin detects medical keyword", "## Pinned" in auto_content,
+          f"content: {auto_content[:200]}")
+
+    # Test that non-critical facts are NOT auto-pinned
+    mh.write_memory_file(REPO, "user_memory", "no-pin-test", "You like hiking on weekends.", "Session 01.09.26")
+    no_pin_content = (Path(REPO) / "user_memory" / "no-pin-test.md").read_text()
+    check("non-critical fact NOT auto-pinned", "## Pinned" not in no_pin_content)
+
+    # Test explicit pinned=True flag
+    mh.write_memory_file(REPO, "user_memory", "explicit-pin", "You prefer dark mode.", "Session 01.09.26", pinned=True)
+    explicit_content = (Path(REPO) / "user_memory" / "explicit-pin.md").read_text()
+    check("explicit pinned=True writes marker", "## Pinned" in explicit_content)
+
+
 def test_full_consolidation():
     """Test full consolidation with live LLM (requires MEMORY_LLM_PROVIDER + creds)."""
     print("\n--- TEST 12: full consolidation (live API) ---")
@@ -440,6 +488,7 @@ def main():
         test_read_transcript_jsonl()
         test_read_transcript_plain()
         test_audn_replace()
+        test_pinned_memories()
         test_full_consolidation()
         test_init_idempotent()
 

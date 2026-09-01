@@ -79,6 +79,9 @@ USER_EXTRACTION_PROMPT = dedent("""\
     - Always second person: "you like coffee", not "he likes coffee".
     - Numbers (gold, credits, prices) are EXCLUDED — they live in state, not memory.
     - Max 8 facts per extraction.
+    - If a fact is safety-critical (allergy, medical condition, medication,
+      emergency contact) or identity-defining (legal name, nationality, native
+      language), set "pinned": true in the output. Otherwise omit or set false.
 
     NEVER extract these — they are transient, not durable:
     - What the agent offered or suggested ("is being offered a date", "was shown X")
@@ -95,7 +98,7 @@ USER_EXTRACTION_PROMPT = dedent("""\
     BAD: "You are talking to the assistant" — obvious, not a fact
 
     Output ONLY valid JSON:
-    {"facts": [{"slug": "likes-coffee", "fact": "You enjoy specialty coffee, especially Ethiopian single origin.", "episode": "Session DD.MM.YY — you mentioned buying a bag from a local roaster."}]}
+    {"facts": [{"slug": "likes-coffee", "fact": "You enjoy specialty coffee, especially Ethiopian single origin.", "episode": "Session DD.MM.YY — you mentioned buying a bag from a local roaster."}, {"slug": "peanut-allergy", "fact": "You are severely allergic to peanuts.", "episode": "Session DD.MM.YY — you warned about this.", "pinned": true}]}
 
     If no durable facts found, return: {"facts": []}
 """)
@@ -150,6 +153,25 @@ AUDN_PROMPT = dedent("""\
 
     Each decision object has: action (ADD|UPDATE|DELETE|NONE), slug, fact, episode, target_slug (for UPDATE/DELETE/NONE).
 """)
+
+
+CRITICAL_PATTERNS = re.compile(
+    r"allerg|medical|medication|disease|emergency|password|"
+    r"credential|api.key|ssn|birth.?date|blood.?type|"
+    r"never.?forget|always.?remember|life.?threatening|"
+    r"epipen|anaphyla|insulin|seizure|disability",
+    re.IGNORECASE,
+)
+IDENTITY_PATTERNS = re.compile(
+    r"(?:my |your )name is|i am a|my job|my role|i work at|"
+    r"i live in|born in|native language|nationality|legal name",
+    re.IGNORECASE,
+)
+
+
+def should_pin(fact_text: str) -> bool:
+    """Detect if a fact is safety-critical or identity-defining and should be pinned."""
+    return bool(CRITICAL_PATTERNS.search(fact_text))
 
 
 def _log(msg: str):
@@ -391,13 +413,17 @@ def _safe_slug(slug: str) -> str:
 
 
 def write_memory_file(repo_path: str, memory_type: str, slug: str, fact: str, episode: str,
-                      seen_slugs: set | None = None):
+                      seen_slugs: set | None = None, pinned: bool = False):
     """Create a new memory .md file. If slug collides (on disk or in batch), suffix it."""
     mem_dir = Path(repo_path) / memory_type
     mem_dir.mkdir(exist_ok=True)
     slug = _safe_slug(slug)
 
     today = date.today().strftime("%d.%m.%y")
+
+    # Auto-detect pinning from content if not explicitly set
+    if not pinned:
+        pinned = should_pin(fact)
 
     # Resolve collisions: on-disk or intra-batch
     base_slug = slug
@@ -421,6 +447,8 @@ def write_memory_file(repo_path: str, memory_type: str, slug: str, fact: str, ep
     filepath = mem_dir / f"{slug}.md"
     content = f"# {slug.replace('-', ' ').title()}\n\n"
     content += f"## Fact\n{fact}\n\n"
+    if pinned:
+        content += f"## Pinned\ncritical\n\n"
     content += f"## Episode\n{episode}\n\n"
     content += f"## Access log\nused, {today}\n"
     filepath.write_text(content, encoding="utf-8")
@@ -482,11 +510,17 @@ def _count_used_stamps(content: str) -> int:
     return sum(1 for line in log_section.splitlines() if line.strip().startswith("used,"))
 
 
-def _use_count_and_recency(filepath: Path) -> tuple[int, float]:
-    """Return (use_count, last_mod_time) for sorting: most used first, recency as tiebreaker."""
+def _is_pinned(content: str) -> bool:
+    """Check if a memory file has a ## Pinned section."""
+    return "## Pinned" in content
+
+
+def _use_count_and_recency(filepath: Path) -> tuple[int, int, float]:
+    """Return (pinned, use_count, last_mod_time) for sorting: pinned first, then most used, recency as tiebreaker."""
     content = filepath.read_text(encoding="utf-8")
     count = _count_used_stamps(content)
-    return (count, filepath.stat().st_mtime)
+    pinned = 1 if _is_pinned(content) else 0
+    return (pinned, count, filepath.stat().st_mtime)
 
 
 def rebuild_index(repo_path: str, memory_type: str):
@@ -500,15 +534,16 @@ def rebuild_index(repo_path: str, memory_type: str):
     files = sorted(mem_dir.glob("*.md"), key=_use_count_and_recency, reverse=True)
 
     header = "# User Memory Index" if memory_type == "user_memory" else "# Character Memory Index"
-    lines = [header, "", "Ranked by use count (most used first, recency as tiebreaker).", ""]
+    lines = [header, "", "Ranked by: pinned first, then use count (most used first, recency as tiebreaker).", ""]
 
     for i, f in enumerate(files, 1):
         content = f.read_text(encoding="utf-8")
         use_count = _count_used_stamps(content)
+        pinned = " 📌 PINNED" if _is_pinned(content) else ""
         fact_match = re.search(r"## Fact\n(.+?)(\n\n|\n##|$)", content, re.DOTALL)
         summary = fact_match.group(1).strip()[:100] if fact_match else f.stem
         contradicted = " ⚠️ CONTRADICTED" if "## Contradicted" in content else ""
-        lines.append(f"{i}. [{f.stem}]({memory_type}/{f.name}) — {summary} (used {use_count}x){contradicted}")
+        lines.append(f"{i}. [{f.stem}]({memory_type}/{f.name}) — {summary} (used {use_count}x){pinned}{contradicted}")
 
     index_file.write_text("\n".join(lines) + "\n", encoding="utf-8")
 
@@ -633,8 +668,9 @@ def _consolidate_inner(repo_path: str, transcript: str):
             episode = d.get("episode", f"Session {today}")
 
             if action == "ADD" and slug:
-                write_memory_file(repo_path, "user_memory", slug, fact, episode, seen_slugs)
-                _log(f"[user] ADD: {slug}")
+                pinned = bool(d.get("pinned"))
+                write_memory_file(repo_path, "user_memory", slug, fact, episode, seen_slugs, pinned=pinned)
+                _log(f"[user] ADD: {slug}{' (pinned)' if pinned or should_pin(fact) else ''}")
             elif action == "UPDATE" and d.get("target_slug"):
                 target = _safe_slug(d["target_slug"])
                 update_memory_file(repo_path, "user_memory", target, fact, episode)
@@ -671,8 +707,9 @@ def _consolidate_inner(repo_path: str, transcript: str):
             episode = d.get("episode", f"Session {today}")
 
             if action == "ADD" and slug:
-                write_memory_file(repo_path, "character_memory", slug, fact, episode, seen_slugs)
-                _log(f"[agent] ADD: {slug}")
+                pinned = bool(d.get("pinned"))
+                write_memory_file(repo_path, "character_memory", slug, fact, episode, seen_slugs, pinned=pinned)
+                _log(f"[agent] ADD: {slug}{' (pinned)' if pinned or should_pin(fact) else ''}")
             elif action == "UPDATE" and d.get("target_slug"):
                 target = _safe_slug(d["target_slug"])
                 update_memory_file(repo_path, "character_memory", target, fact, episode)
