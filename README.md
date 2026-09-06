@@ -21,7 +21,7 @@ User sends message
        │
        ▼
 ┌─────────────────┐
-│ Context Assembly │  character.md + character_memory/ + user.md + user_memory/
+│ Context Assembly │  SOUL.md + character_memory/ + USER.md + user_memory/
 │ + LLM Call       │  → assembled into system prompt → streamed response
 └────────┬────────┘
          │
@@ -52,7 +52,7 @@ Inspired by [Mem0](https://github.com/mem0ai/mem0). For each extracted fact, com
 **Character Memory** — how the agent adapted for this person:
 > "Use casual tone with this user", "He responds well to code-first answers"
 
-`character.md` is the base persona (same for everyone). `character_memory/` is the delta (unique per user).
+`SOUL.md` is the base persona (same for everyone, nanobot-compatible naming). `character_memory/` is the delta (unique per user).
 
 ## Architecture
 
@@ -61,10 +61,8 @@ viral-git-agent-memory/
 ├── api_server.py      # HTTP server: /v1/chat (SSE), /v1/bye, /v1/git/setup, /health
 ├── memory_hook.py     # Consolidation engine: extraction, A.U.D.N., git commit
 ├── template/          # Blank user repo skeleton
-│   ├── character.md
-│   ├── user.md
-│   ├── user_memory.md
-│   ├── character_memory.md
+│   ├── SOUL.md        # Base persona (nanobot-compatible naming)
+│   ├── USER.md        # User profile
 │   ├── user_memory/
 │   ├── character_memory/
 │   └── .gitignore
@@ -75,14 +73,12 @@ viral-git-agent-memory/
 Each user gets their own repo:
 ```
 ~/memory/user_123/
-├── user.md                    # Who they are
-├── character.md               # Base persona
-├── user_memory.md             # Index (ranked by use count)
+├── USER.md                    # Who they are
+├── SOUL.md                    # Base persona
 ├── user_memory/
 │   ├── likes-coffee.md        # Individual memory files
 │   ├── works-as-engineer.md
 │   └── has-dog-named-pixel.md
-├── character_memory.md        # Index (ranked by use count)
 ├── character_memory/
 │   ├── prefers-bullet-points.md
 │   └── use-casual-tone.md
@@ -252,7 +248,7 @@ used, 31.08.26
 used, 02.09.26
 ```
 
-Memories are **never deleted** — unused ones sink to the bottom of the index. When a buried topic resurfaces, it jumps back to the top. The `used` stamps drive the ranking: most-used memories load into context first.
+Memories are **never deleted** — unused ones sink via recency. When a buried topic resurfaces, it jumps back. The `used` stamps track access frequency.
 
 ## Concurrency & Reliability
 
@@ -272,7 +268,7 @@ Memories are **never deleted** — unused ones sink to the bottom of the index. 
 
 ## Agent-Agnostic
 
-The same system works for any agent type — just change `character.md`:
+The same system works for any agent type — just change `SOUL.md`:
 
 | Agent | character_memory/ learns... |
 |-------|---------------------------|

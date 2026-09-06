@@ -58,10 +58,10 @@ def test_init_repo():
 
     check("user_memory/ exists", (Path(REPO) / "user_memory").is_dir())
     check("character_memory/ exists", (Path(REPO) / "character_memory").is_dir())
-    check("character.md exists", (Path(REPO) / "character.md").is_file())
-    check("user.md exists", (Path(REPO) / "user.md").is_file())
+    check("SOUL.md exists", (Path(REPO) / "SOUL.md").is_file())
+    check("USER.md exists", (Path(REPO) / "USER.md").is_file())
 
-    user_md = (Path(REPO) / "user.md").read_text()
+    user_md = (Path(REPO) / "USER.md").read_text()
     check("user ID stamped", "stress_user_42" in user_md, f"got: {user_md[:100]}")
 
     # Init git repo for later tests
@@ -204,29 +204,18 @@ def test_use_count_ranking():
         f = Path(REPO) / "user_memory" / "medium-fact.md"
         f.write_text(f.read_text() + "\nused, 30.08.26")
 
-    mh.rebuild_index(REPO, "user_memory")
-    index = (Path(REPO) / "user_memory.md").read_text()
+    # Verify per-fact files exist with correct use counts
+    common_content = (Path(REPO) / "user_memory" / "common-fact.md").read_text()
+    common_count = mh._count_used_stamps(common_content)
+    check("common-fact has 5 uses", common_count == 5, f"got {common_count}")
 
-    # Find positions of our three test facts among ALL numbered lines
-    numbered_lines = [l for l in index.split("\n") if l and l[0].isdigit() and "." in l[:4]]
-    common_pos = next((i for i, l in enumerate(numbered_lines) if "common-fact" in l), -1)
-    medium_pos = next((i for i, l in enumerate(numbered_lines) if "medium-fact" in l), -1)
-    rare_pos = next((i for i, l in enumerate(numbered_lines) if "rare-fact" in l), -1)
+    medium_content = (Path(REPO) / "user_memory" / "medium-fact.md").read_text()
+    medium_count = mh._count_used_stamps(medium_content)
+    check("medium-fact has 3 uses", medium_count == 3, f"got {medium_count}")
 
-    check("common-fact ranked highest (5 uses)", common_pos != -1 and common_pos < medium_pos,
-          f"positions: common={common_pos}, medium={medium_pos}, rare={rare_pos}")
-    check("medium-fact ranked middle (3 uses)", medium_pos != -1 and rare_pos != -1 and medium_pos < rare_pos,
-          f"positions: common={common_pos}, medium={medium_pos}, rare={rare_pos}")
-    check("index shows use counts", "(used 5x)" in index, f"index:\n{index[:300]}")
-
-
-def test_rebuild_index_contradicted():
-    """Test that contradicted memories show the warning in the index."""
-    print("\n--- TEST 6: rebuild_index with contradicted ---")
-
-    mh.rebuild_index(REPO, "user_memory")
-    index = (Path(REPO) / "user_memory.md").read_text()
-    check("contradicted flag in index", "CONTRADICTED" in index, f"index:\n{index[:500]}")
+    rare_content = (Path(REPO) / "user_memory" / "rare-fact.md").read_text()
+    rare_count = mh._count_used_stamps(rare_content)
+    check("rare-fact has 1 use", rare_count == 1, f"got {rare_count}")
 
 
 def test_git_commit():
@@ -344,16 +333,13 @@ def test_pinned_memories():
     # Create another unpinned memory
     mh.write_memory_file(REPO, "user_memory", "low-use-unpinned", "You like blue.", "Session 01.09.26")
 
-    mh.rebuild_index(REPO, "user_memory")
-    index = (Path(REPO) / "user_memory.md").read_text()
+    # Verify pinned file has pinned section
+    pinned_content = (Path(REPO) / "user_memory" / "peanut-allergy.md").read_text()
+    check("pinned memory has ## Pinned section", "## Pinned" in pinned_content)
 
-    numbered_lines = [l for l in index.split("\n") if l and l[0].isdigit() and "." in l[:4]]
-    pinned_pos = next((i for i, l in enumerate(numbered_lines) if "peanut-allergy" in l), -1)
-    high_use_pos = next((i for i, l in enumerate(numbered_lines) if "high-use-unpinned" in l), -1)
-
-    check("pinned memory ranks above high-use unpinned", pinned_pos < high_use_pos,
-          f"pinned={pinned_pos}, high_use={high_use_pos}")
-    check("pinned badge in index", "PINNED" in index)
+    # Verify unpinned doesn't
+    unpinned_content = (Path(REPO) / "user_memory" / "high-use-unpinned.md").read_text()
+    check("unpinned memory has no ## Pinned section", "## Pinned" not in unpinned_content)
 
     # Test auto-pinning via should_pin()
     mh.write_memory_file(REPO, "user_memory", "auto-pin-test", "You take insulin daily for diabetes.", "Session 01.09.26")
@@ -428,9 +414,10 @@ def test_full_consolidation():
     char_files = list((Path(REPO) / "character_memory").glob("*.md"))
     check("character memories created", len(char_files) > 0, f"got {len(char_files)} files")
 
-    # Check index files show use counts
-    user_index = (Path(REPO) / "user_memory.md").read_text()
-    check("user index has use counts", "used" in user_index and "x)" in user_index)
+    # Check per-fact files have access logs
+    user_files = list((Path(REPO) / "user_memory").glob("*.md"))
+    has_access = any("## Access log" in f.read_text() for f in user_files) if user_files else False
+    check("user memories have access logs", has_access)
 
     # Check git committed
     result = subprocess.run(["git", "log", "--oneline"], cwd=REPO, capture_output=True, text=True)
@@ -482,7 +469,6 @@ def main():
         test_missing_target_logging()
         test_used_count_accuracy()
         test_use_count_ranking()
-        test_rebuild_index_contradicted()
         test_git_commit()
         test_parse_json()
         test_read_transcript_jsonl()

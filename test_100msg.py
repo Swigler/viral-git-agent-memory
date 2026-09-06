@@ -14,7 +14,7 @@ from pathlib import Path
 
 # Add parent to path so we can import memory_hook
 sys.path.insert(0, str(Path(__file__).parent))
-from memory_hook import init_repo, consolidate, rebuild_index
+from memory_hook import init_repo, consolidate
 
 REPO = "/tmp/test_100msg"
 

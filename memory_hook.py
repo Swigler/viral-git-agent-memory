@@ -358,10 +358,10 @@ def init_repo(repo_path: str, user_id: str):
     template_dir = Path(__file__).parent / "template"
 
     if not repo.exists() and template_dir.exists():
-        # Copy full template (CLAUDE.md, character.md, user.md, indexes, dirs)
+        # Copy full template (CLAUDE.md, SOUL.md, USER.md, dirs)
         shutil.copytree(template_dir, repo)
         # Stamp user ID
-        user_md = repo / "user.md"
+        user_md = repo / "USER.md"
         user_md.write_text(
             user_md.read_text(encoding="utf-8").replace("User ID: no_one", f"User ID: {user_id}"),
             encoding="utf-8",
@@ -372,6 +372,14 @@ def init_repo(repo_path: str, user_id: str):
     # Ensure dirs exist (template has them, but just in case)
     (repo / "user_memory").mkdir(exist_ok=True)
     (repo / "character_memory").mkdir(exist_ok=True)
+
+    # Migration: rename old files to nanobot-compatible names
+    old_char = repo / "character.md"
+    old_user = repo / "user.md"
+    if old_char.exists() and not (repo / "SOUL.md").exists():
+        old_char.rename(repo / "SOUL.md")
+    if old_user.exists() and not (repo / "USER.md").exists():
+        old_user.rename(repo / "USER.md")
 
 
 def load_existing_memories(repo_path: str, memory_type: str) -> list[dict]:
@@ -521,31 +529,6 @@ def _use_count_and_recency(filepath: Path) -> tuple[int, int, float]:
     count = _count_used_stamps(content)
     pinned = 1 if _is_pinned(content) else 0
     return (pinned, count, filepath.stat().st_mtime)
-
-
-def rebuild_index(repo_path: str, memory_type: str):
-    """Rebuild the index file sorted by use count (most used first), recency as tiebreaker."""
-    mem_dir = Path(repo_path) / memory_type
-    index_file = Path(repo_path) / f"{memory_type}.md"
-
-    if not mem_dir.is_dir():
-        return
-
-    files = sorted(mem_dir.glob("*.md"), key=_use_count_and_recency, reverse=True)
-
-    header = "# User Memory Index" if memory_type == "user_memory" else "# Character Memory Index"
-    lines = [header, "", "Ranked by: pinned first, then use count (most used first, recency as tiebreaker).", ""]
-
-    for i, f in enumerate(files, 1):
-        content = f.read_text(encoding="utf-8")
-        use_count = _count_used_stamps(content)
-        pinned = " 📌 PINNED" if _is_pinned(content) else ""
-        fact_match = re.search(r"## Fact\n(.+?)(\n\n|\n##|$)", content, re.DOTALL)
-        summary = fact_match.group(1).strip()[:100] if fact_match else f.stem
-        contradicted = " ⚠️ CONTRADICTED" if "## Contradicted" in content else ""
-        lines.append(f"{i}. [{f.stem}]({memory_type}/{f.name}) — {summary} (used {use_count}x){pinned}{contradicted}")
-
-    index_file.write_text("\n".join(lines) + "\n", encoding="utf-8")
 
 
 def git_commit(repo_path: str):
@@ -727,12 +710,7 @@ def _consolidate_inner(repo_path: str, transcript: str):
                     mem_file.write_text(content, encoding="utf-8")
                 _log(f"[agent] NONE: {d['target_slug']}")
 
-    # --- Step 5: Rebuild indexes ---
-    rebuild_index(repo_path, "user_memory")
-    rebuild_index(repo_path, "character_memory")
-    _log("[consolidate] indexes rebuilt")
-
-    # --- Step 6: Git commit ---
+    # --- Step 5: Git commit ---
     git_commit(repo_path)
 
 

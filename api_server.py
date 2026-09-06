@@ -122,17 +122,11 @@ def get_user_repo(user_id: str) -> Path:
             shutil.copytree(TEMPLATE_DIR, repo)
         else:
             repo.mkdir(parents=True)
-            (repo / "user.md").write_text(
+            (repo / "USER.md").write_text(
                 "# User Profile\n\n## Identity\n- User ID: no_one\n"
             )
-            (repo / "character.md").write_text(
+            (repo / "SOUL.md").write_text(
                 "# Character\n\nBase persona.\n"
-            )
-            (repo / "user_memory.md").write_text(
-                "# User Memory Index\n\nRanked by recency.\n"
-            )
-            (repo / "character_memory.md").write_text(
-                "# Character Memory Index\n\nRanked by recency.\n"
             )
             (repo / "user_memory").mkdir(exist_ok=True)
             (repo / "character_memory").mkdir(exist_ok=True)
@@ -207,21 +201,33 @@ def load_top_memories(repo: Path, memory_type: str, n: int = TOP_N_MEMORIES) -> 
 
 def assemble_context(repo: Path, state: dict) -> list[dict]:
     """
-    Build the full message array for DeepSeek:
-    1. character.md (base persona)
+    Build the full message array for the LLM:
+    1. SOUL.md (base persona)
     2. character_memory/ top N (adaptations for this person)
-    3. user.md (who they are)
+    3. USER.md (who they are)
     4. user_memory/ top N (what we know about them)
     5. history (last N turns)
     """
     # 1. Character base
-    character = (repo / "character.md").read_text(encoding="utf-8") if (repo / "character.md").exists() else ""
+    soul = repo / "SOUL.md"
+    char_legacy = repo / "character.md"
+    character = ""
+    if soul.exists():
+        character = soul.read_text(encoding="utf-8")
+    elif char_legacy.exists():
+        character = char_legacy.read_text(encoding="utf-8")
 
     # 2. Character adaptations
     char_memories = load_top_memories(repo, "character_memory")
 
     # 3. User profile
-    user_profile = (repo / "user.md").read_text(encoding="utf-8") if (repo / "user.md").exists() else ""
+    user_f = repo / "USER.md"
+    user_legacy = repo / "user.md"
+    user_profile = ""
+    if user_f.exists():
+        user_profile = user_f.read_text(encoding="utf-8")
+    elif user_legacy.exists():
+        user_profile = user_legacy.read_text(encoding="utf-8")
 
     # 4. User memories
     user_memories = load_top_memories(repo, "user_memory")
