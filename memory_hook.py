@@ -636,79 +636,103 @@ def _consolidate_inner(repo_path: str, transcript: str):
     # --- Step 3+4: A.U.D.N. for user memories ---
     if user_facts:
         existing = load_existing_memories(repo_path, "USER_memory")
-        existing_text = format_existing_for_prompt(existing)
-        new_text = json.dumps(user_facts, indent=2)
 
-        prompt = AUDN_PROMPT.replace("__EXISTING__", existing_text).replace("__NEW_FACTS__", new_text)
-        raw = call_llm(prompt, "Decide what to do with each new fact.")
-        decisions = parse_json(raw).get("decisions", [])
+        if not existing:
+            # No existing memories — skip AUDN, ADD everything directly
+            _log("[user] empty memory — adding all facts directly")
+            seen_slugs: set[str] = set()
+            for f in user_facts:
+                slug = f.get("slug", "")
+                if slug:
+                    pinned = bool(f.get("pinned"))
+                    write_memory_file(repo_path, "USER_memory", slug, f.get("fact", ""),
+                                      f.get("episode", f"Session {today}"), seen_slugs, pinned=pinned)
+                    _log(f"[user] ADD: {slug}{' (pinned)' if pinned or should_pin(f.get('fact', '')) else ''}")
+        else:
+            existing_text = format_existing_for_prompt(existing)
+            new_text = json.dumps(user_facts, indent=2)
 
-        seen_slugs: set[str] = set()
-        for d in decisions:
-            action = d.get("action", "").upper()
-            slug = d.get("slug", "")
-            fact = d.get("fact", "")
-            episode = d.get("episode", f"Session {today}")
+            prompt = AUDN_PROMPT.replace("__EXISTING__", existing_text).replace("__NEW_FACTS__", new_text)
+            raw = call_llm(prompt, "Decide what to do with each new fact.")
+            decisions = parse_json(raw).get("decisions", [])
 
-            if action == "ADD" and slug:
-                pinned = bool(d.get("pinned"))
-                write_memory_file(repo_path, "USER_memory", slug, fact, episode, seen_slugs, pinned=pinned)
-                _log(f"[user] ADD: {slug}{' (pinned)' if pinned or should_pin(fact) else ''}")
-            elif action == "UPDATE" and d.get("target_slug"):
-                target = _safe_slug(d["target_slug"])
-                update_memory_file(repo_path, "USER_memory", target, fact, episode)
-                _log(f"[user] UPDATE: {target}")
-            elif action == "DELETE" and d.get("target_slug"):
-                target = _safe_slug(d["target_slug"])
-                mark_contradicted(repo_path, "USER_memory", target)
-                _log(f"[user] DELETE: {target}")
-            elif action == "NONE" and d.get("target_slug"):
-                # Stamp "used" on the existing file
-                target = _safe_slug(d["target_slug"])
-                mem_file = Path(repo_path) / "USER_memory" / f"{target}.md"
-                if mem_file.exists():
-                    content = mem_file.read_text(encoding="utf-8")
-                    content += f"\nused, {today}"
-                    mem_file.write_text(content, encoding="utf-8")
-                _log(f"[user] NONE: {d['target_slug']}")
+            seen_slugs: set[str] = set()
+            for d in decisions:
+                action = d.get("action", "").upper()
+                slug = d.get("slug", "")
+                fact = d.get("fact", "")
+                episode = d.get("episode", f"Session {today}")
+
+                if action == "ADD" and slug:
+                    pinned = bool(d.get("pinned"))
+                    write_memory_file(repo_path, "USER_memory", slug, fact, episode, seen_slugs, pinned=pinned)
+                    _log(f"[user] ADD: {slug}{' (pinned)' if pinned or should_pin(fact) else ''}")
+                elif action == "UPDATE" and d.get("target_slug"):
+                    target = _safe_slug(d["target_slug"])
+                    update_memory_file(repo_path, "USER_memory", target, fact, episode)
+                    _log(f"[user] UPDATE: {target}")
+                elif action == "DELETE" and d.get("target_slug"):
+                    target = _safe_slug(d["target_slug"])
+                    mark_contradicted(repo_path, "USER_memory", target)
+                    _log(f"[user] DELETE: {target}")
+                elif action == "NONE" and d.get("target_slug"):
+                    target = _safe_slug(d["target_slug"])
+                    mem_file = Path(repo_path) / "USER_memory" / f"{target}.md"
+                    if mem_file.exists():
+                        content = mem_file.read_text(encoding="utf-8")
+                        content += f"\nused, {today}"
+                        mem_file.write_text(content, encoding="utf-8")
+                    _log(f"[user] NONE: {d['target_slug']}")
 
     # --- Step 3+4: A.U.D.N. for agent memories ---
     if agent_facts:
         existing = load_existing_memories(repo_path, "SOUL_memory")
-        existing_text = format_existing_for_prompt(existing)
-        new_text = json.dumps(agent_facts, indent=2)
 
-        prompt = AUDN_PROMPT.replace("__EXISTING__", existing_text).replace("__NEW_FACTS__", new_text)
-        raw = call_llm(prompt, "Decide what to do with each new fact.")
-        decisions = parse_json(raw).get("decisions", [])
+        if not existing:
+            _log("[agent] empty memory — adding all facts directly")
+            seen_slugs: set[str] = set()
+            for f in agent_facts:
+                slug = f.get("slug", "")
+                if slug:
+                    pinned = bool(f.get("pinned"))
+                    write_memory_file(repo_path, "SOUL_memory", slug, f.get("fact", ""),
+                                      f.get("episode", f"Session {today}"), seen_slugs, pinned=pinned)
+                    _log(f"[agent] ADD: {slug}{' (pinned)' if pinned or should_pin(f.get('fact', '')) else ''}")
+        else:
+            existing_text = format_existing_for_prompt(existing)
+            new_text = json.dumps(agent_facts, indent=2)
 
-        seen_slugs: set[str] = set()
-        for d in decisions:
-            action = d.get("action", "").upper()
-            slug = d.get("slug", "")
-            fact = d.get("fact", "")
-            episode = d.get("episode", f"Session {today}")
+            prompt = AUDN_PROMPT.replace("__EXISTING__", existing_text).replace("__NEW_FACTS__", new_text)
+            raw = call_llm(prompt, "Decide what to do with each new fact.")
+            decisions = parse_json(raw).get("decisions", [])
 
-            if action == "ADD" and slug:
-                pinned = bool(d.get("pinned"))
-                write_memory_file(repo_path, "SOUL_memory", slug, fact, episode, seen_slugs, pinned=pinned)
-                _log(f"[agent] ADD: {slug}{' (pinned)' if pinned or should_pin(fact) else ''}")
-            elif action == "UPDATE" and d.get("target_slug"):
-                target = _safe_slug(d["target_slug"])
-                update_memory_file(repo_path, "SOUL_memory", target, fact, episode)
-                _log(f"[agent] UPDATE: {target}")
-            elif action == "DELETE" and d.get("target_slug"):
-                target = _safe_slug(d["target_slug"])
-                mark_contradicted(repo_path, "SOUL_memory", target)
-                _log(f"[agent] DELETE: {target}")
-            elif action == "NONE" and d.get("target_slug"):
-                target = _safe_slug(d["target_slug"])
-                mem_file = Path(repo_path) / "SOUL_memory" / f"{target}.md"
-                if mem_file.exists():
-                    content = mem_file.read_text(encoding="utf-8")
-                    content += f"\nused, {today}"
-                    mem_file.write_text(content, encoding="utf-8")
-                _log(f"[agent] NONE: {d['target_slug']}")
+            seen_slugs: set[str] = set()
+            for d in decisions:
+                action = d.get("action", "").upper()
+                slug = d.get("slug", "")
+                fact = d.get("fact", "")
+                episode = d.get("episode", f"Session {today}")
+
+                if action == "ADD" and slug:
+                    pinned = bool(d.get("pinned"))
+                    write_memory_file(repo_path, "SOUL_memory", slug, fact, episode, seen_slugs, pinned=pinned)
+                    _log(f"[agent] ADD: {slug}{' (pinned)' if pinned or should_pin(fact) else ''}")
+                elif action == "UPDATE" and d.get("target_slug"):
+                    target = _safe_slug(d["target_slug"])
+                    update_memory_file(repo_path, "SOUL_memory", target, fact, episode)
+                    _log(f"[agent] UPDATE: {target}")
+                elif action == "DELETE" and d.get("target_slug"):
+                    target = _safe_slug(d["target_slug"])
+                    mark_contradicted(repo_path, "SOUL_memory", target)
+                    _log(f"[agent] DELETE: {target}")
+                elif action == "NONE" and d.get("target_slug"):
+                    target = _safe_slug(d["target_slug"])
+                    mem_file = Path(repo_path) / "SOUL_memory" / f"{target}.md"
+                    if mem_file.exists():
+                        content = mem_file.read_text(encoding="utf-8")
+                        content += f"\nused, {today}"
+                        mem_file.write_text(content, encoding="utf-8")
+                    _log(f"[agent] NONE: {d['target_slug']}")
 
     # --- Step 5: Git commit ---
     git_commit(repo_path)
