@@ -69,7 +69,7 @@ TEMPLATE_DIR = Path(__file__).parent / "template"
 PORT = int(os.environ.get("PORT", "3100"))
 API_KEY = os.environ.get("API_KEY", "")
 
-# How many user_memory / character_memory files to load into context
+# How many USER_memory / SOUL_memory files to load into context
 TOP_N_MEMORIES = 10
 # History: last N turns kept in working memory
 HISTORY_LIMIT = 16
@@ -126,10 +126,10 @@ def get_user_repo(user_id: str) -> Path:
                 "# User Profile\n\n## Identity\n- User ID: no_one\n"
             )
             (repo / "SOUL.md").write_text(
-                "# Character\n\nBase persona.\n"
+                "# SOUL\n\nBase persona.\n"
             )
-            (repo / "user_memory").mkdir(exist_ok=True)
-            (repo / "character_memory").mkdir(exist_ok=True)
+            (repo / "USER_memory").mkdir(exist_ok=True)
+            (repo / "SOUL_memory").mkdir(exist_ok=True)
 
         # Git init
         subprocess.run(["git", "init"], cwd=repo, capture_output=True)
@@ -203,22 +203,22 @@ def assemble_context(repo: Path, state: dict) -> list[dict]:
     """
     Build the full message array for the LLM:
     1. SOUL.md (base persona)
-    2. character_memory/ top N (adaptations for this person)
+    2. SOUL_memory/ top N (adaptations for this person)
     3. USER.md (who they are)
-    4. user_memory/ top N (what we know about them)
+    4. USER_memory/ top N (what we know about them)
     5. history (last N turns)
     """
-    # 1. Character base
+    # 1. SOUL base
     soul = repo / "SOUL.md"
-    char_legacy = repo / "character.md"
-    character = ""
+    soul_legacy = repo / "character.md"
+    soul_text = ""
     if soul.exists():
-        character = soul.read_text(encoding="utf-8")
-    elif char_legacy.exists():
-        character = char_legacy.read_text(encoding="utf-8")
+        soul_text = soul.read_text(encoding="utf-8")
+    elif soul_legacy.exists():
+        soul_text = soul_legacy.read_text(encoding="utf-8")
 
-    # 2. Character adaptations
-    char_memories = load_top_memories(repo, "character_memory")
+    # 2. SOUL adaptations
+    soul_memories = load_top_memories(repo, "SOUL_memory")
 
     # 3. User profile
     user_f = repo / "USER.md"
@@ -230,14 +230,14 @@ def assemble_context(repo: Path, state: dict) -> list[dict]:
         user_profile = user_legacy.read_text(encoding="utf-8")
 
     # 4. User memories
-    user_memories = load_top_memories(repo, "user_memory")
+    user_memories = load_top_memories(repo, "USER_memory")
 
     # Build system prompt
     system_parts = []
-    if character:
-        system_parts.append(character)
-    if char_memories:
-        system_parts.append(f"\n## How you've adapted for this user\n{char_memories}")
+    if soul_text:
+        system_parts.append(soul_text)
+    if soul_memories:
+        system_parts.append(f"\n## How you've adapted for this user\n{soul_memories}")
     if user_profile:
         system_parts.append(f"\n## About this user\n{user_profile}")
     if user_memories:

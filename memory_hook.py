@@ -370,20 +370,20 @@ def init_repo(repo_path: str, user_id: str):
         repo.mkdir(parents=True, exist_ok=True)
 
     # Ensure dirs exist (template has them, but just in case)
-    (repo / "user_memory").mkdir(exist_ok=True)
-    (repo / "character_memory").mkdir(exist_ok=True)
+    (repo / "USER_memory").mkdir(exist_ok=True)
+    (repo / "SOUL_memory").mkdir(exist_ok=True)
 
     # Migration: rename old files to nanobot-compatible names
-    old_char = repo / "character.md"
+    old_soul = repo / "character.md"
     old_user = repo / "user.md"
-    if old_char.exists() and not (repo / "SOUL.md").exists():
-        old_char.rename(repo / "SOUL.md")
+    if old_soul.exists() and not (repo / "SOUL.md").exists():
+        old_soul.rename(repo / "SOUL.md")
     if old_user.exists() and not (repo / "USER.md").exists():
         old_user.rename(repo / "USER.md")
 
 
 def load_existing_memories(repo_path: str, memory_type: str) -> list[dict]:
-    """Load existing memory files from user_memory/ or character_memory/."""
+    """Load existing memory files from USER_memory/ or SOUL_memory/."""
     mem_dir = Path(repo_path) / memory_type
     if not mem_dir.is_dir():
         return []
@@ -635,7 +635,7 @@ def _consolidate_inner(repo_path: str, transcript: str):
 
     # --- Step 3+4: A.U.D.N. for user memories ---
     if user_facts:
-        existing = load_existing_memories(repo_path, "user_memory")
+        existing = load_existing_memories(repo_path, "USER_memory")
         existing_text = format_existing_for_prompt(existing)
         new_text = json.dumps(user_facts, indent=2)
 
@@ -652,20 +652,20 @@ def _consolidate_inner(repo_path: str, transcript: str):
 
             if action == "ADD" and slug:
                 pinned = bool(d.get("pinned"))
-                write_memory_file(repo_path, "user_memory", slug, fact, episode, seen_slugs, pinned=pinned)
+                write_memory_file(repo_path, "USER_memory", slug, fact, episode, seen_slugs, pinned=pinned)
                 _log(f"[user] ADD: {slug}{' (pinned)' if pinned or should_pin(fact) else ''}")
             elif action == "UPDATE" and d.get("target_slug"):
                 target = _safe_slug(d["target_slug"])
-                update_memory_file(repo_path, "user_memory", target, fact, episode)
+                update_memory_file(repo_path, "USER_memory", target, fact, episode)
                 _log(f"[user] UPDATE: {target}")
             elif action == "DELETE" and d.get("target_slug"):
                 target = _safe_slug(d["target_slug"])
-                mark_contradicted(repo_path, "user_memory", target)
+                mark_contradicted(repo_path, "USER_memory", target)
                 _log(f"[user] DELETE: {target}")
             elif action == "NONE" and d.get("target_slug"):
                 # Stamp "used" on the existing file
                 target = _safe_slug(d["target_slug"])
-                mem_file = Path(repo_path) / "user_memory" / f"{target}.md"
+                mem_file = Path(repo_path) / "USER_memory" / f"{target}.md"
                 if mem_file.exists():
                     content = mem_file.read_text(encoding="utf-8")
                     content += f"\nused, {today}"
@@ -674,7 +674,7 @@ def _consolidate_inner(repo_path: str, transcript: str):
 
     # --- Step 3+4: A.U.D.N. for agent memories ---
     if agent_facts:
-        existing = load_existing_memories(repo_path, "character_memory")
+        existing = load_existing_memories(repo_path, "SOUL_memory")
         existing_text = format_existing_for_prompt(existing)
         new_text = json.dumps(agent_facts, indent=2)
 
@@ -691,19 +691,19 @@ def _consolidate_inner(repo_path: str, transcript: str):
 
             if action == "ADD" and slug:
                 pinned = bool(d.get("pinned"))
-                write_memory_file(repo_path, "character_memory", slug, fact, episode, seen_slugs, pinned=pinned)
+                write_memory_file(repo_path, "SOUL_memory", slug, fact, episode, seen_slugs, pinned=pinned)
                 _log(f"[agent] ADD: {slug}{' (pinned)' if pinned or should_pin(fact) else ''}")
             elif action == "UPDATE" and d.get("target_slug"):
                 target = _safe_slug(d["target_slug"])
-                update_memory_file(repo_path, "character_memory", target, fact, episode)
+                update_memory_file(repo_path, "SOUL_memory", target, fact, episode)
                 _log(f"[agent] UPDATE: {target}")
             elif action == "DELETE" and d.get("target_slug"):
                 target = _safe_slug(d["target_slug"])
-                mark_contradicted(repo_path, "character_memory", target)
+                mark_contradicted(repo_path, "SOUL_memory", target)
                 _log(f"[agent] DELETE: {target}")
             elif action == "NONE" and d.get("target_slug"):
                 target = _safe_slug(d["target_slug"])
-                mem_file = Path(repo_path) / "character_memory" / f"{target}.md"
+                mem_file = Path(repo_path) / "SOUL_memory" / f"{target}.md"
                 if mem_file.exists():
                     content = mem_file.read_text(encoding="utf-8")
                     content += f"\nused, {today}"

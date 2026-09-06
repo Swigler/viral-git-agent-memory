@@ -56,8 +56,8 @@ def test_init_repo():
     print("\n--- TEST 1: init_repo ---")
     mh.init_repo(REPO, "stress_user_42")
 
-    check("user_memory/ exists", (Path(REPO) / "user_memory").is_dir())
-    check("character_memory/ exists", (Path(REPO) / "character_memory").is_dir())
+    check("USER_memory/ exists", (Path(REPO) / "USER_memory").is_dir())
+    check("SOUL_memory/ exists", (Path(REPO) / "SOUL_memory").is_dir())
     check("SOUL.md exists", (Path(REPO) / "SOUL.md").is_file())
     check("USER.md exists", (Path(REPO) / "USER.md").is_file())
 
@@ -77,8 +77,8 @@ def test_write_memory_file():
     """Test creating and appending to memory files."""
     print("\n--- TEST 2: write_memory_file ---")
 
-    mh.write_memory_file(REPO, "user_memory", "likes-pizza", "You love pizza.", "Session 30.08.26 — you ordered a margherita.")
-    f = Path(REPO) / "user_memory" / "likes-pizza.md"
+    mh.write_memory_file(REPO, "USER_memory", "likes-pizza", "You love pizza.", "Session 30.08.26 — you ordered a margherita.")
+    f = Path(REPO) / "USER_memory" / "likes-pizza.md"
     check("file created", f.is_file())
     content = f.read_text()
     check("has Fact section", "## Fact" in content)
@@ -88,8 +88,8 @@ def test_write_memory_file():
     check("fact correct", "You love pizza." in content)
 
     # Write again with same slug — should create likes-pizza-2.md (collision handling)
-    mh.write_memory_file(REPO, "user_memory", "likes-pizza", "You also love pasta.", "Session 31.08.26")
-    f2 = Path(REPO) / "user_memory" / "likes-pizza-2.md"
+    mh.write_memory_file(REPO, "USER_memory", "likes-pizza", "You also love pasta.", "Session 31.08.26")
+    f2 = Path(REPO) / "USER_memory" / "likes-pizza-2.md"
     check("slug collision creates suffixed file", f2.is_file())
     check("original file unchanged", "You love pizza." in f.read_text())
     check("new file has new fact", "You also love pasta." in f2.read_text())
@@ -100,13 +100,13 @@ def test_intra_batch_dedup():
     print("\n--- TEST 2b: intra-batch dedup ---")
 
     seen = set()
-    mh.write_memory_file(REPO, "user_memory", "batch-test", "First fact", "Ep1", seen)
-    mh.write_memory_file(REPO, "user_memory", "batch-test", "Second fact", "Ep2", seen)
-    mh.write_memory_file(REPO, "user_memory", "batch-test", "Third fact", "Ep3", seen)
+    mh.write_memory_file(REPO, "USER_memory", "batch-test", "First fact", "Ep1", seen)
+    mh.write_memory_file(REPO, "USER_memory", "batch-test", "Second fact", "Ep2", seen)
+    mh.write_memory_file(REPO, "USER_memory", "batch-test", "Third fact", "Ep3", seen)
 
-    f1 = Path(REPO) / "user_memory" / "batch-test.md"
-    f2 = Path(REPO) / "user_memory" / "batch-test-2.md"
-    f3 = Path(REPO) / "user_memory" / "batch-test-3.md"
+    f1 = Path(REPO) / "USER_memory" / "batch-test.md"
+    f2 = Path(REPO) / "USER_memory" / "batch-test-2.md"
+    f3 = Path(REPO) / "USER_memory" / "batch-test-3.md"
 
     check("batch file 1 created", f1.is_file())
     check("batch file 2 created (dedup)", f2.is_file())
@@ -120,10 +120,10 @@ def test_update_memory_file():
     """Test updating an existing memory."""
     print("\n--- TEST 3: update_memory_file ---")
 
-    mh.write_memory_file(REPO, "user_memory", "job-title", "You work in IT.", "Session 30.08.26")
-    mh.update_memory_file(REPO, "user_memory", "job-title", "You work as a senior DevOps engineer.", "Session 30.08.26 — you clarified your role.")
+    mh.write_memory_file(REPO, "USER_memory", "job-title", "You work in IT.", "Session 30.08.26")
+    mh.update_memory_file(REPO, "USER_memory", "job-title", "You work as a senior DevOps engineer.", "Session 30.08.26 — you clarified your role.")
 
-    content = (Path(REPO) / "user_memory" / "job-title.md").read_text()
+    content = (Path(REPO) / "USER_memory" / "job-title.md").read_text()
     check("fact updated", "senior DevOps engineer" in content)
     check("old fact gone", "You work in IT." not in content)
     check("access log preserved", "used," in content)
@@ -133,15 +133,15 @@ def test_mark_contradicted():
     """Test contradiction marking."""
     print("\n--- TEST 4: mark_contradicted ---")
 
-    mh.write_memory_file(REPO, "user_memory", "has-cat", "You have a cat named Whiskers.", "Session 29.08.26")
-    mh.mark_contradicted(REPO, "user_memory", "has-cat")
+    mh.write_memory_file(REPO, "USER_memory", "has-cat", "You have a cat named Whiskers.", "Session 29.08.26")
+    mh.mark_contradicted(REPO, "USER_memory", "has-cat")
 
-    content = (Path(REPO) / "user_memory" / "has-cat.md").read_text()
+    content = (Path(REPO) / "USER_memory" / "has-cat.md").read_text()
     check("contradicted marker added", "## Contradicted" in content)
 
     # Mark again — should not duplicate
-    mh.mark_contradicted(REPO, "user_memory", "has-cat")
-    content2 = (Path(REPO) / "user_memory" / "has-cat.md").read_text()
+    mh.mark_contradicted(REPO, "USER_memory", "has-cat")
+    content2 = (Path(REPO) / "USER_memory" / "has-cat.md").read_text()
     count = content2.count("## Contradicted")
     check("no duplicate contradicted marker", count == 1, f"got {count}")
 
@@ -151,14 +151,14 @@ def test_missing_target_logging():
     print("\n--- TEST 4b: missing target handling ---")
 
     # DELETE on non-existent slug should not crash
-    mh.mark_contradicted(REPO, "user_memory", "totally-fake-slug")
+    mh.mark_contradicted(REPO, "USER_memory", "totally-fake-slug")
     check("DELETE on missing slug doesn't crash", True)
-    f = Path(REPO) / "user_memory" / "totally-fake-slug.md"
+    f = Path(REPO) / "USER_memory" / "totally-fake-slug.md"
     check("DELETE on missing slug doesn't create file", not f.is_file())
 
     # UPDATE on non-existent slug should create new file (fallback)
-    mh.update_memory_file(REPO, "user_memory", "also-fake", "Fallback fact", "Fallback episode")
-    f2 = Path(REPO) / "user_memory" / "also-fake.md"
+    mh.update_memory_file(REPO, "USER_memory", "also-fake", "Fallback fact", "Fallback episode")
+    f2 = Path(REPO) / "USER_memory" / "also-fake.md"
     check("UPDATE on missing slug creates fallback file", f2.is_file())
     check("fallback file has correct fact", "Fallback fact" in f2.read_text())
 
@@ -168,7 +168,7 @@ def test_used_count_accuracy():
     print("\n--- TEST 4c: used-count accuracy ---")
 
     # Create a memory with 'used,' appearing in the fact text (should NOT be counted)
-    mem_dir = Path(REPO) / "user_memory"
+    mem_dir = Path(REPO) / "USER_memory"
     tricky = mem_dir / "tricky-count.md"
     tricky.write_text(
         "# Tricky Count\n\n"
@@ -188,32 +188,32 @@ def test_use_count_ranking():
 
     # Create memories with different use counts
     # "rare" — 1 use
-    mh.write_memory_file(REPO, "user_memory", "rare-fact", "You mentioned something once.", "Session 25.08.26")
+    mh.write_memory_file(REPO, "USER_memory", "rare-fact", "You mentioned something once.", "Session 25.08.26")
     time.sleep(0.05)
 
     # "common" — 5 uses
-    mh.write_memory_file(REPO, "user_memory", "common-fact", "You always do this.", "Session 20.08.26")
+    mh.write_memory_file(REPO, "USER_memory", "common-fact", "You always do this.", "Session 20.08.26")
     for _ in range(4):
-        f = Path(REPO) / "user_memory" / "common-fact.md"
+        f = Path(REPO) / "USER_memory" / "common-fact.md"
         f.write_text(f.read_text() + "\nused, 30.08.26")
     time.sleep(0.05)
 
     # "medium" — 3 uses (most recently modified!)
-    mh.write_memory_file(REPO, "user_memory", "medium-fact", "You do this sometimes.", "Session 28.08.26")
+    mh.write_memory_file(REPO, "USER_memory", "medium-fact", "You do this sometimes.", "Session 28.08.26")
     for _ in range(2):
-        f = Path(REPO) / "user_memory" / "medium-fact.md"
+        f = Path(REPO) / "USER_memory" / "medium-fact.md"
         f.write_text(f.read_text() + "\nused, 30.08.26")
 
     # Verify per-fact files exist with correct use counts
-    common_content = (Path(REPO) / "user_memory" / "common-fact.md").read_text()
+    common_content = (Path(REPO) / "USER_memory" / "common-fact.md").read_text()
     common_count = mh._count_used_stamps(common_content)
     check("common-fact has 5 uses", common_count == 5, f"got {common_count}")
 
-    medium_content = (Path(REPO) / "user_memory" / "medium-fact.md").read_text()
+    medium_content = (Path(REPO) / "USER_memory" / "medium-fact.md").read_text()
     medium_count = mh._count_used_stamps(medium_content)
     check("medium-fact has 3 uses", medium_count == 3, f"got {medium_count}")
 
-    rare_content = (Path(REPO) / "user_memory" / "rare-fact.md").read_text()
+    rare_content = (Path(REPO) / "USER_memory" / "rare-fact.md").read_text()
     rare_count = mh._count_used_stamps(rare_content)
     check("rare-fact has 1 use", rare_count == 1, f"got {rare_count}")
 
@@ -320,41 +320,41 @@ def test_pinned_memories():
     import time
 
     # Create a high-use unpinned memory
-    mh.write_memory_file(REPO, "user_memory", "high-use-unpinned", "You drink tea.", "Session 01.09.26")
-    f = Path(REPO) / "user_memory" / "high-use-unpinned.md"
+    mh.write_memory_file(REPO, "USER_memory", "high-use-unpinned", "You drink tea.", "Session 01.09.26")
+    f = Path(REPO) / "USER_memory" / "high-use-unpinned.md"
     for _ in range(10):
         f.write_text(f.read_text() + "\nused, 01.09.26")
     time.sleep(0.05)
 
     # Create a low-use pinned memory
-    mh.write_memory_file(REPO, "user_memory", "peanut-allergy", "You are severely allergic to peanuts.", "Session 01.09.26", pinned=True)
+    mh.write_memory_file(REPO, "USER_memory", "peanut-allergy", "You are severely allergic to peanuts.", "Session 01.09.26", pinned=True)
     time.sleep(0.05)
 
     # Create another unpinned memory
-    mh.write_memory_file(REPO, "user_memory", "low-use-unpinned", "You like blue.", "Session 01.09.26")
+    mh.write_memory_file(REPO, "USER_memory", "low-use-unpinned", "You like blue.", "Session 01.09.26")
 
     # Verify pinned file has pinned section
-    pinned_content = (Path(REPO) / "user_memory" / "peanut-allergy.md").read_text()
+    pinned_content = (Path(REPO) / "USER_memory" / "peanut-allergy.md").read_text()
     check("pinned memory has ## Pinned section", "## Pinned" in pinned_content)
 
     # Verify unpinned doesn't
-    unpinned_content = (Path(REPO) / "user_memory" / "high-use-unpinned.md").read_text()
+    unpinned_content = (Path(REPO) / "USER_memory" / "high-use-unpinned.md").read_text()
     check("unpinned memory has no ## Pinned section", "## Pinned" not in unpinned_content)
 
     # Test auto-pinning via should_pin()
-    mh.write_memory_file(REPO, "user_memory", "auto-pin-test", "You take insulin daily for diabetes.", "Session 01.09.26")
-    auto_content = (Path(REPO) / "user_memory" / "auto-pin-test.md").read_text()
+    mh.write_memory_file(REPO, "USER_memory", "auto-pin-test", "You take insulin daily for diabetes.", "Session 01.09.26")
+    auto_content = (Path(REPO) / "USER_memory" / "auto-pin-test.md").read_text()
     check("auto-pin detects medical keyword", "## Pinned" in auto_content,
           f"content: {auto_content[:200]}")
 
     # Test that non-critical facts are NOT auto-pinned
-    mh.write_memory_file(REPO, "user_memory", "no-pin-test", "You like hiking on weekends.", "Session 01.09.26")
-    no_pin_content = (Path(REPO) / "user_memory" / "no-pin-test.md").read_text()
+    mh.write_memory_file(REPO, "USER_memory", "no-pin-test", "You like hiking on weekends.", "Session 01.09.26")
+    no_pin_content = (Path(REPO) / "USER_memory" / "no-pin-test.md").read_text()
     check("non-critical fact NOT auto-pinned", "## Pinned" not in no_pin_content)
 
     # Test explicit pinned=True flag
-    mh.write_memory_file(REPO, "user_memory", "explicit-pin", "You prefer dark mode.", "Session 01.09.26", pinned=True)
-    explicit_content = (Path(REPO) / "user_memory" / "explicit-pin.md").read_text()
+    mh.write_memory_file(REPO, "USER_memory", "explicit-pin", "You prefer dark mode.", "Session 01.09.26", pinned=True)
+    explicit_content = (Path(REPO) / "USER_memory" / "explicit-pin.md").read_text()
     check("explicit pinned=True writes marker", "## Pinned" in explicit_content)
 
 
@@ -371,7 +371,7 @@ def test_full_consolidation():
         return
 
     # Clean the memory dirs for a fresh run
-    for d in ["user_memory", "character_memory"]:
+    for d in ["USER_memory", "SOUL_memory"]:
         mem_dir = Path(REPO) / d
         for f in mem_dir.glob("*.md"):
             f.unlink()
@@ -396,7 +396,7 @@ def test_full_consolidation():
     mh.consolidate(REPO, transcript)
 
     # Check user memories
-    user_files = list((Path(REPO) / "user_memory").glob("*.md"))
+    user_files = list((Path(REPO) / "USER_memory").glob("*.md"))
     check("user memories created", len(user_files) > 0, f"got {len(user_files)} files")
 
     all_content = " ".join(f.read_text() for f in user_files).lower()
@@ -410,12 +410,12 @@ def test_full_consolidation():
     check("NOT extracted: 'offering you'", "offering you" not in all_content)
     check("NOT extracted: 'let me think'", "let me think" not in all_content)
 
-    # Check character memories
-    char_files = list((Path(REPO) / "character_memory").glob("*.md"))
-    check("character memories created", len(char_files) > 0, f"got {len(char_files)} files")
+    # Check SOUL memories
+    char_files = list((Path(REPO) / "SOUL_memory").glob("*.md"))
+    check("SOUL memories created", len(char_files) > 0, f"got {len(char_files)} files")
 
     # Check per-fact files have access logs
-    user_files = list((Path(REPO) / "user_memory").glob("*.md"))
+    user_files = list((Path(REPO) / "USER_memory").glob("*.md"))
     has_access = any("## Access log" in f.read_text() for f in user_files) if user_files else False
     check("user memories have access logs", has_access)
 
@@ -434,7 +434,7 @@ def test_full_consolidation():
 
     mh.consolidate(REPO, transcript2)
 
-    all_content2 = " ".join(f.read_text() for f in (Path(REPO) / "user_memory").glob("*.md")).lower()
+    all_content2 = " ".join(f.read_text() for f in (Path(REPO) / "USER_memory").glob("*.md")).lower()
     check("AUDN: job updated to software engineer", "software engineer" in all_content2)
     # Climbing should still be there (NONE or UPDATE)
     check("AUDN: climbing still present", "climb" in all_content2)
@@ -450,10 +450,10 @@ def test_init_idempotent():
     print("\n--- TEST 13: init_repo idempotent ---")
 
     # Write a memory, then re-init
-    mh.write_memory_file(REPO, "user_memory", "survives-reinit", "This should survive.", "Test")
+    mh.write_memory_file(REPO, "USER_memory", "survives-reinit", "This should survive.", "Test")
     mh.init_repo(REPO, "different_user")
 
-    f = Path(REPO) / "user_memory" / "survives-reinit.md"
+    f = Path(REPO) / "USER_memory" / "survives-reinit.md"
     check("memory survives re-init", f.is_file())
     check("content intact", "This should survive." in f.read_text())
 

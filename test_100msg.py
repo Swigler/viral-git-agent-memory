@@ -171,7 +171,7 @@ def run_test():
         print(f"  ⏱️  {elapsed:.1f}s")
 
         # Show current state
-        for mem_type in ["user_memory", "character_memory"]:
+        for mem_type in ["USER_memory", "SOUL_memory"]:
             mem_dir = Path(REPO) / mem_type
             files = sorted(mem_dir.glob("*.md"))
             print(f"\n  {mem_type}: {len(files)} files")
@@ -190,7 +190,7 @@ def run_test():
         print(f"    {line}")
 
     # Show final indexes
-    for mem_type in ["user_memory", "character_memory"]:
+    for mem_type in ["USER_memory", "SOUL_memory"]:
         idx = Path(REPO) / f"{mem_type}.md"
         if idx.exists():
             print(f"\n{'='*60}")

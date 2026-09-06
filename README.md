@@ -2,7 +2,7 @@
 
 Brain-inspired memory system for AI agents. Git-native, human-readable, zero dependencies.
 
-Every user gets their own git repo of markdown files. The agent learns who you are (user memory) and how to talk to you (character memory) — and you can `git log` the entire history.
+Every user gets their own git repo of markdown files. The agent learns who you are (USER memory) and how to talk to you (SOUL memory) — and you can `git log` the entire history.
 
 ## Why This Exists
 
@@ -21,7 +21,7 @@ User sends message
        │
        ▼
 ┌─────────────────┐
-│ Context Assembly │  SOUL.md + character_memory/ + USER.md + user_memory/
+│ Context Assembly │  SOUL.md + SOUL_memory/ + USER.md + USER_memory/
 │ + LLM Call       │  → assembled into system prompt → streamed response
 └────────┬────────┘
          │
@@ -49,10 +49,10 @@ Inspired by [Mem0](https://github.com/mem0ai/mem0). For each extracted fact, com
 **User Memory** — facts about the person:
 > "You work as a backend engineer", "You prefer bullet points", "Your dog is named Pixel"
 
-**Character Memory** — how the agent adapted for this person:
+**SOUL Memory** — how the agent adapted for this person:
 > "Use casual tone with this user", "He responds well to code-first answers"
 
-`SOUL.md` is the base persona (same for everyone, nanobot-compatible naming). `character_memory/` is the delta (unique per user).
+`SOUL.md` is the base persona (same for everyone, nanobot-compatible naming). `SOUL_memory/` is the delta (unique per user).
 
 ## Architecture
 
@@ -63,8 +63,8 @@ viral-git-agent-memory/
 ├── template/          # Blank user repo skeleton
 │   ├── SOUL.md        # Base persona (nanobot-compatible naming)
 │   ├── USER.md        # User profile
-│   ├── user_memory/
-│   ├── character_memory/
+│   ├── USER_memory/
+│   ├── SOUL_memory/
 │   └── .gitignore
 ├── stress_test.py     # Load testing
 └── test_100msg.py     # 100-message conversation test
@@ -75,11 +75,11 @@ Each user gets their own repo:
 ~/memory/user_123/
 ├── USER.md                    # Who they are
 ├── SOUL.md                    # Base persona
-├── user_memory/
+├── USER_memory/
 │   ├── likes-coffee.md        # Individual memory files
 │   ├── works-as-engineer.md
 │   └── has-dog-named-pixel.md
-├── character_memory/
+├── SOUL_memory/
 │   ├── prefers-bullet-points.md
 │   └── use-casual-tone.md
 └── .git/                      # Full history
@@ -105,7 +105,7 @@ python memory_hook.py --test /tmp/test_repo
 
 Example test output (offline, no LLM):
 ```
-  ✅ user_memory/ exists
+  ✅ USER_memory/ exists
   ✅ file created
   ✅ slug collision creates suffixed file
   ✅ batch file 2 created (dedup)
@@ -270,7 +270,7 @@ Memories are **never deleted** — unused ones sink via recency. When a buried t
 
 The same system works for any agent type — just change `SOUL.md`:
 
-| Agent | character_memory/ learns... |
+| Agent | SOUL_memory/ learns... |
 |-------|---------------------------|
 | Companion | "Slow teasing works", "Use pet names" |
 | Work assistant | "Bullet points, formal tone" |
