@@ -54,6 +54,17 @@ from datetime import date, datetime
 from pathlib import Path
 from socketserver import ThreadingMixIn
 
+# Git and GitHub-credential handling lives in memory_hook: it owns git_commit, so the
+# mirror push happens there for every consolidation path. One home for the auth code —
+# a second copy is a second thing to remember to fix.
+from memory_hook import (  # noqa: F401 — push_to_github is re-exported for memory-bot/loop.py
+    GITHUB_REMOTE,
+    git_auth,
+    load_git_credentials,
+    push_to_github,
+    save_git_credentials,
+)
+
 # --- LLM Provider Config (same env vars as memory_hook.py) ---
 LLM_PROVIDER = os.environ.get("MEMORY_LLM_PROVIDER", "").lower()
 OPENAI_API_URL = os.environ.get("OPENAI_API_URL", "https://api.openai.com").rstrip("/")
@@ -523,34 +534,6 @@ def _github_api(endpoint: str, token: str, method: str = "GET", payload: dict | 
         return None
 
 
-def _git_credentials_path(repo: Path) -> Path:
-    return repo / ".git_credentials.json"
-
-
-def _load_git_credentials(repo: Path) -> dict:
-    cred_path = _git_credentials_path(repo)
-    if cred_path.exists():
-        try:
-            return json.loads(cred_path.read_text(encoding="utf-8"))
-        except (json.JSONDecodeError, OSError):
-            pass
-    return {}
-
-
-def _save_git_credentials(repo: Path, creds: dict):
-    cred_path = _git_credentials_path(repo)
-    cred_path.write_text(json.dumps(creds, indent=2), encoding="utf-8")
-    # Ensure .git_credentials.json is in .gitignore
-    gitignore = repo / ".gitignore"
-    if gitignore.exists():
-        content = gitignore.read_text(encoding="utf-8")
-        if ".git_credentials.json" not in content:
-            with open(gitignore, "a", encoding="utf-8") as f:
-                f.write("\n.git_credentials.json\n")
-    else:
-        gitignore.write_text(".git_credentials.json\n", encoding="utf-8")
-
-
 def setup_github_remote(repo: Path, token: str, repo_name: str | None = None) -> dict:
     """
     Validate GitHub token, create private repo if needed, set as remote, initial push.
@@ -577,64 +560,49 @@ def setup_github_remote(repo: Path, token: str, repo_name: str | None = None) ->
         return {"ok": False, "error": "Failed to create GitHub repo — check token permissions (needs 'repo' scope)"}
 
     repo_url = f"https://github.com/{gh_username}/{repo_name}"
-    remote_url = f"https://x-access-token:{token}@github.com/{gh_username}/{repo_name}.git"
+    # No credentials in the URL — git_auth supplies them per command instead.
+    remote_url = f"https://x-access-token@github.com/{gh_username}/{repo_name}.git"
 
-    # 3. Set remote (remove old one if exists, then add)
-    subprocess.run(["git", "remote", "remove", "origin"], cwd=repo, capture_output=True)
-    result = subprocess.run(
-        ["git", "remote", "add", "origin", remote_url],
-        cwd=repo, capture_output=True, text=True,
-    )
-    if result.returncode != 0:
-        return {"ok": False, "error": f"Failed to set git remote: {result.stderr.strip()[:100]}"}
-
-    # 4. Initial push
-    env = {
-        **os.environ,
-        "GIT_AUTHOR_NAME": "memory-server",
-        "GIT_AUTHOR_EMAIL": "server@viral-git-agent-memory",
-        "GIT_COMMITTER_NAME": "memory-server",
-        "GIT_COMMITTER_EMAIL": "server@viral-git-agent-memory",
-    }
-    # Ensure there's at least one commit
-    subprocess.run(["git", "add", "-A"], cwd=repo, capture_output=True, env=env)
-    subprocess.run(
-        ["git", "commit", "-m", "init memory vault", "--allow-empty"],
-        cwd=repo, capture_output=True, text=True, env=env,
-    )
-
-    push = subprocess.run(
-        ["git", "push", "-u", "origin", "main"],
-        cwd=repo, capture_output=True, text=True, env=env,
-    )
-    if push.returncode != 0:
-        # Try master branch instead
-        push = subprocess.run(
-            ["git", "push", "-u", "origin", "master"],
-            cwd=repo, capture_output=True, text=True, env=env,
+    with git_auth(token) as env:
+        # 3. Point the github remote at it, leaving origin (the memory store) alone.
+        subprocess.run(
+            ["git", "remote", "remove", GITHUB_REMOTE], cwd=repo, capture_output=True
         )
-    if push.returncode != 0:
-        # Try getting current branch name and pushing that
-        branch = subprocess.run(
-            ["git", "branch", "--show-current"],
+        result = subprocess.run(
+            ["git", "remote", "add", GITHUB_REMOTE, remote_url],
             cwd=repo, capture_output=True, text=True,
         )
+        if result.returncode != 0:
+            return {"ok": False, "error": f"Failed to set git remote: {result.stderr.strip()[:100]}"}
+
+        # 4. Initial push. Ensure there's at least one commit first.
+        subprocess.run(["git", "add", "-A"], cwd=repo, capture_output=True, env=env)
+        subprocess.run(
+            ["git", "commit", "-m", "init memory vault", "--allow-empty"],
+            cwd=repo, capture_output=True, text=True, env=env,
+        )
+        branch = subprocess.run(
+            ["git", "branch", "--show-current"], cwd=repo, capture_output=True, text=True,
+        )
         branch_name = branch.stdout.strip() or "main"
+        # No -u: the upstream stays the memory store, so a later bare `git push`
+        # (memory_hook.git_commit does exactly that) still goes there and not here.
         push = subprocess.run(
-            ["git", "push", "-u", "origin", branch_name],
+            ["git", "push", GITHUB_REMOTE, branch_name],
             cwd=repo, capture_output=True, text=True, env=env,
         )
     if push.returncode != 0:
-        # Sanitize stderr to avoid leaking token in error response
-        err_msg = re.sub(r'https://[^@]+@', 'https://***@', push.stderr.strip()[:200])
-        return {"ok": False, "error": f"Repo created but push failed: {err_msg}"}
+        return {"ok": False, "error": f"Repo created but push failed: {push.stderr.strip()[:200]}"}
 
-    # 5. Save credentials
-    _save_git_credentials(repo, {
+    # 5. Save credentials. The token is kept (0600, gitignored) because every later
+    # consolidation has to authenticate a push without the user being there to retype
+    # it. It stays out of .git/config, out of argv and out of every response.
+    save_git_credentials(repo, {
         "github_username": gh_username,
         "repo_name": repo_name,
         "repo_url": repo_url,
         "configured_at": datetime.now().isoformat(),
+        "token": token,
     })
 
     log(f"[github] setup complete for {gh_username}/{repo_name}")
@@ -937,7 +905,7 @@ class ChatHandler(http.server.BaseHTTPRequestHandler):
         response = {"userId": user_id, "connected": False}
 
         if repo.exists():
-            creds = _load_git_credentials(repo)
+            creds = load_git_credentials(repo)
             if creds:
                 response["connected"] = True
                 response["github_username"] = creds.get("github_username", "")

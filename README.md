@@ -94,8 +94,11 @@ This project is **built and code-reviewed but not yet production-tested or perso
 ### Tests
 
 ```bash
-# Offline test suite — 58 assertions, no API key needed
+# Offline test suite — 62 assertions, no API key needed
 python stress_test.py
+
+# GitHub credential + mirror-push checks (no network, local bare repos stand in)
+python test_github_auth.py
 
 # Full test with live LLM (runs extraction + AUDN on a fake conversation)
 MEMORY_LLM_PROVIDER=ollama python stress_test.py
@@ -313,8 +316,15 @@ python bench.py     # 28k scale check
 ## Security
 
 - **Path traversal prevention** on user IDs and LLM-generated slugs
+- **Token never written into git** — the GitHub token is passed per-command through a
+  throwaway `GIT_ASKPASS` helper, so it is in neither the remote URL (which would land
+  in `.git/config` in plaintext and come back out in git's own error messages) nor
+  `argv` (visible in `ps`)
 - **Token sanitization** — GitHub tokens never appear in logs or error responses
-- **Credentials gitignored** — `.git_credentials.json` is never committed or pushed
+- **Credentials gitignored and 0600** — `.git_credentials.json` is created private and
+  is never committed or pushed
+- **The mirror is a separate remote** — the user's GitHub is `github`, never `origin`,
+  so connecting it cannot repoint the operator's memory store
 - **Optional API key** — Bearer token auth for the server
 - **Private repos** — GitHub repos are created as private by default
 

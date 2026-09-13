@@ -43,8 +43,10 @@ import os
 import re
 import subprocess
 import sys
+import tempfile
 import urllib.request
 import urllib.error
+from contextlib import contextmanager
 from datetime import date
 from pathlib import Path
 from textwrap import dedent
@@ -178,14 +180,23 @@ def _log(msg: str):
     print(msg, file=sys.stderr, flush=True)
 
 
-def call_openai(system_prompt: str, user_content: str) -> str:
-    """Call any OpenAI-compatible API (OpenAI, DeepSeek, Together, Groq, etc.)."""
-    if not OPENAI_API_KEY:
-        _log("[error] OPENAI_API_KEY not set")
+def call_openai(system_prompt: str, user_content: str, creds: dict | None = None) -> str:
+    """Call any OpenAI-compatible API (OpenAI, DeepSeek, Together, Groq, etc.).
+
+    `creds` overrides the module-level env config for one call: {"api_key", "api_url",
+    "model"}. That is what lets one process serve many users on their own keys instead
+    of a single tenant configured at startup.
+    """
+    creds = creds or {}
+    api_key = creds.get("api_key") or OPENAI_API_KEY
+    api_url = (creds.get("api_url") or OPENAI_API_URL).rstrip("/")
+    model = creds.get("model") or OPENAI_MODEL
+    if not api_key:
+        _log("[error] no API key — neither creds nor OPENAI_API_KEY")
         return ""
 
     payload = json.dumps({
-        "model": OPENAI_MODEL,
+        "model": model,
         "temperature": 0.2,
         "max_tokens": 2048,
         "response_format": {"type": "json_object"},
@@ -195,13 +206,13 @@ def call_openai(system_prompt: str, user_content: str) -> str:
         ],
     }).encode()
 
-    url = f"{OPENAI_API_URL}/v1/chat/completions"
+    url = f"{api_url}/v1/chat/completions"
     req = urllib.request.Request(
         url,
         data=payload,
         headers={
             "Content-Type": "application/json",
-            "Authorization": f"Bearer {OPENAI_API_KEY}",
+            "Authorization": f"Bearer {api_key}",
         },
         method="POST",
     )
@@ -282,8 +293,15 @@ def call_ollama(system_prompt: str, user_content: str) -> str:
         return ""
 
 
-def call_llm(system_prompt: str, user_content: str) -> str:
-    """Dispatch to the configured LLM provider."""
+def call_llm(system_prompt: str, user_content: str, creds: dict | None = None) -> str:
+    """Dispatch to the configured LLM provider.
+
+    A per-user `creds` always goes to the OpenAI-compatible path — OpenRouter, which
+    is what users bring, speaks that dialect — and bypasses MEMORY_LLM_PROVIDER, so a
+    multi-tenant server does not need the env config set at all.
+    """
+    if creds and creds.get("api_key"):
+        return call_openai(system_prompt, user_content, creds)
     if not LLM_PROVIDER:
         _log("[error] MEMORY_LLM_PROVIDER not set — must be 'openai', 'anthropic', or 'ollama'")
         sys.exit(1)
@@ -531,6 +549,102 @@ def _use_count_and_recency(filepath: Path) -> tuple[int, int, float]:
     return (pinned, count, filepath.stat().st_mtime)
 
 
+# --- GitHub mirror ---
+#
+# The remote for the user's own GitHub mirror. Deliberately NOT "origin": origin is
+# wherever the operator stores memory. Overwriting it means the first user who
+# connects GitHub silently stops saving to that store.
+GITHUB_REMOTE = "github"
+
+# Per-user GitHub credentials. Lives inside the repo but is gitignored and 0600, so it
+# is never committed and never pushed. The token has to survive a server restart —
+# without it "every consolidation auto-pushes" is not possible at all.
+CREDENTIALS_FILE = ".git_credentials.json"
+
+
+def git_credentials_path(repo: Path) -> Path:
+    return repo / CREDENTIALS_FILE
+
+
+def load_git_credentials(repo: Path) -> dict:
+    try:
+        return json.loads(git_credentials_path(repo).read_text(encoding="utf-8"))
+    except (json.JSONDecodeError, OSError):
+        return {}
+
+
+def save_git_credentials(repo: Path, creds: dict):
+    """Write credentials 0600 and make sure git never picks the file up."""
+    path = git_credentials_path(repo)
+    # Create with 0600 from the start — writing then chmod leaves a window where the
+    # token is world-readable.
+    fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+    with os.fdopen(fd, "w", encoding="utf-8") as f:
+        json.dump(creds, f, indent=2)
+    os.chmod(path, 0o600)  # pre-existing file keeps its old mode through O_CREAT
+
+    gitignore = repo / ".gitignore"
+    content = gitignore.read_text(encoding="utf-8") if gitignore.exists() else ""
+    if CREDENTIALS_FILE not in content:
+        with open(gitignore, "a", encoding="utf-8") as f:
+            f.write(("\n" if content and not content.endswith("\n") else "") + CREDENTIALS_FILE + "\n")
+
+
+@contextmanager
+def git_auth(token: str):
+    """Yield an env that authenticates git without the token ever being written down.
+
+    The token goes in neither the remote URL (which lands in .git/config in plaintext
+    and is echoed back in git's own error messages) nor argv (visible in `ps`). It is
+    passed to a throwaway GIT_ASKPASS helper through the environment instead.
+    """
+    fd, helper = tempfile.mkstemp(prefix="git-askpass-")
+    try:
+        os.write(fd, b'#!/bin/sh\nprintf %s "$GIT_ACCESS_TOKEN"\n')
+        os.close(fd)
+        os.chmod(helper, 0o700)
+        yield {
+            **os.environ,
+            "GIT_ASKPASS": helper,
+            "GIT_ACCESS_TOKEN": token,
+            "GIT_TERMINAL_PROMPT": "0",
+            "GIT_AUTHOR_NAME": "memory-server",
+            "GIT_AUTHOR_EMAIL": "server@viral-git-agent-memory",
+            "GIT_COMMITTER_NAME": "memory-server",
+            "GIT_COMMITTER_EMAIL": "server@viral-git-agent-memory",
+        }
+    finally:
+        os.unlink(helper)
+
+
+def push_to_github(repo: Path, token: str | None = None) -> bool:
+    """Mirror the repo to the user's GitHub. Returns False if GitHub isn't connected.
+
+    Separate from git_commit's own push, which goes to the operator's memory store.
+    `token` defaults to the one saved by /v1/git/setup.
+    """
+    repo = Path(repo)
+    token = token or load_git_credentials(repo).get("token", "")
+    if not token:
+        return False
+    remotes = subprocess.run(["git", "remote"], cwd=repo, capture_output=True, text=True)
+    if GITHUB_REMOTE not in remotes.stdout.split():
+        return False
+    branch = subprocess.run(
+        ["git", "branch", "--show-current"], cwd=repo, capture_output=True, text=True,
+    )
+    with git_auth(token) as env:
+        push = subprocess.run(
+            ["git", "push", GITHUB_REMOTE, branch.stdout.strip() or "main"],
+            cwd=repo, capture_output=True, text=True, env=env,
+        )
+    if push.returncode != 0:
+        _log(f"[github] mirror push failed: {push.stderr.strip()[:200]}")
+    else:
+        _log("[github] mirrored")
+    return push.returncode == 0
+
+
 def git_commit(repo_path: str):
     """Git add + commit after consolidation. Safe to call even if nothing changed."""
     repo = Path(repo_path)
@@ -567,12 +681,19 @@ def git_commit(repo_path: str):
                 err_msg = re.sub(r'https://[^@]+@', 'https://***@', push.stderr.strip()[:100])
                 _log(f"[git] push failed: {err_msg}")
     else:
-        stderr = result.stderr.strip()
-        if "nothing to commit" in stderr or "working tree clean" in stderr:
+        # "nothing to commit" goes to STDOUT, not stderr — checking stderr alone
+        # reported every no-op consolidation as a hard failure.
+        output = (result.stdout + result.stderr).strip()
+        if "nothing to commit" in output or "working tree clean" in output:
             _log("[git] nothing to commit")
         else:
             # Real error: disk full, identity misconfigured, index locked, etc.
-            _log(f"[git] COMMIT FAILED (rc={result.returncode}): {stderr[:200]}")
+            _log(f"[git] COMMIT FAILED (rc={result.returncode}): {output[:200]}")
+
+    # Mirror to the user's own GitHub, if they connected one. Runs even when this
+    # consolidation committed nothing: that is what re-syncs a mirror left behind by
+    # an earlier push failure, and it costs one "Everything up-to-date" otherwise.
+    push_to_github(repo)
 
 
 # --- Main Consolidation Flow ---
@@ -601,7 +722,7 @@ class _UserLock:
         return False
 
 
-def consolidate(repo_path: str, transcript: str):
+def consolidate(repo_path: str, transcript: str, creds: dict | None = None):
     """
     Full consolidation cycle:
     1. Extract user facts
@@ -614,22 +735,22 @@ def consolidate(repo_path: str, transcript: str):
     Uses a per-user file lock to prevent concurrent consolidations from racing.
     """
     with _UserLock(repo_path):
-        _consolidate_inner(repo_path, transcript)
+        _consolidate_inner(repo_path, transcript, creds)
 
 
-def _consolidate_inner(repo_path: str, transcript: str):
+def _consolidate_inner(repo_path: str, transcript: str, creds: dict | None = None):
     """Inner consolidation logic, called under lock."""
     today = date.today().strftime("%d.%m.%y")
 
     # --- Step 1: User fact extraction ---
     _log("[consolidate] extracting user facts...")
-    raw = call_llm(USER_EXTRACTION_PROMPT, f"TRANSCRIPT:\n{transcript}")
+    raw = call_llm(USER_EXTRACTION_PROMPT, f"TRANSCRIPT:\n{transcript}", creds)
     user_facts = parse_json(raw).get("facts", [])
     _log(f"[consolidate] got {len(user_facts)} user facts")
 
     # --- Step 2: Agent adaptation extraction ---
     _log("[consolidate] extracting agent adaptations...")
-    raw = call_llm(AGENT_EXTRACTION_PROMPT, f"TRANSCRIPT:\n{transcript}")
+    raw = call_llm(AGENT_EXTRACTION_PROMPT, f"TRANSCRIPT:\n{transcript}", creds)
     agent_facts = parse_json(raw).get("facts", [])
     _log(f"[consolidate] got {len(agent_facts)} agent facts")
 
@@ -653,7 +774,7 @@ def _consolidate_inner(repo_path: str, transcript: str):
             new_text = json.dumps(user_facts, indent=2)
 
             prompt = AUDN_PROMPT.replace("__EXISTING__", existing_text).replace("__NEW_FACTS__", new_text)
-            raw = call_llm(prompt, "Decide what to do with each new fact.")
+            raw = call_llm(prompt, "Decide what to do with each new fact.", creds)
             decisions = parse_json(raw).get("decisions", [])
 
             seen_slugs: set[str] = set()
@@ -703,7 +824,7 @@ def _consolidate_inner(repo_path: str, transcript: str):
             new_text = json.dumps(agent_facts, indent=2)
 
             prompt = AUDN_PROMPT.replace("__EXISTING__", existing_text).replace("__NEW_FACTS__", new_text)
-            raw = call_llm(prompt, "Decide what to do with each new fact.")
+            raw = call_llm(prompt, "Decide what to do with each new fact.", creds)
             decisions = parse_json(raw).get("decisions", [])
 
             seen_slugs: set[str] = set()

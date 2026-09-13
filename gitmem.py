@@ -35,8 +35,14 @@ MEMORY_TYPES = ("SOUL", "USER")
 BEHAVIOURAL = "SOUL"  # always-loaded into the prompt; recall() never search-ranks it
 FACTUAL = "USER"  # unbounded, asked about directly; this is the side search is for
 INDEX_FILE = "index.sqlite3"
+LOCK_FILE = ".gitmem.lock"
 INDEX_BEGIN = "<!-- gitmem:index:begin -->"
 INDEX_END = "<!-- gitmem:index:end -->"
+
+# Derived files that must never enter git: the index is rebuilt from the markdown in
+# seconds, but it is ~2x the size of the markdown and rewritten whole on every commit,
+# so tracking it means every version of a binary blob lives in history forever.
+DERIVED = (INDEX_FILE, f"{INDEX_FILE}-wal", f"{INDEX_FILE}-shm", LOCK_FILE)
 
 _SCHEMA = """
 CREATE TABLE IF NOT EXISTS memories (
@@ -185,7 +191,7 @@ class _lock:
     """Exclusive per-repo lock. viral-git already locks consolidations; writes need it too."""
 
     def __init__(self, repo):
-        self._path = Path(repo) / ".gitmem.lock"
+        self._path = Path(repo) / LOCK_FILE
 
     def __enter__(self):
         self._fh = open(self._path, "w")
@@ -209,21 +215,48 @@ class Memory:
             self.repo.mkdir(parents=True, exist_ok=True)
             for memory_type in MEMORY_TYPES:
                 (self.repo / f"{memory_type}_memory").mkdir(exist_ok=True)
-            gitignore = self.repo / ".gitignore"
-            if not gitignore.exists():
-                gitignore.write_text(
-                    f"{INDEX_FILE}\n{INDEX_FILE}-wal\n{INDEX_FILE}-shm\n.gitmem.lock\n",
-                    encoding="utf-8",
-                )
             if not (self.repo / ".git").is_dir():
                 subprocess.run(["git", "init", "-q"], cwd=self.repo, capture_output=True)
         elif not self.repo.is_dir():
             raise FileNotFoundError(repo)
 
+        # Before the index file is created, not only when creating the repo: repos
+        # seeded from template/ already have a .gitignore, and the old "write one if
+        # absent" left those tracking the index forever.
+        self._ensure_derived_ignored()
+
         self.db = sqlite3.connect(self.repo / INDEX_FILE)
         self.db.executescript(_SCHEMA)
         self.db.commit()
         self.sync()
+
+    def _ensure_derived_ignored(self):
+        """Append any missing DERIVED entries to .gitignore, and untrack them once.
+
+        Appends rather than writes: a repo seeded from template/ already has a
+        .gitignore, and overwriting it would drop the entries that protect the
+        transcripts, the consolidation log and the GitHub credentials.
+        """
+        gitignore = self.repo / ".gitignore"
+        content = gitignore.read_text(encoding="utf-8") if gitignore.exists() else ""
+        present = set(content.split())
+        missing = [name for name in DERIVED if name not in present]
+        if not missing:
+            return
+
+        with open(gitignore, "a", encoding="utf-8") as f:
+            if content and not content.endswith("\n"):
+                f.write("\n")
+            f.write("\n".join(missing) + "\n")
+
+        # Migration for repos that already committed the index: .gitignore does not
+        # apply to tracked files, so it has to leave the index too. --cached keeps the
+        # file on disk, and --ignore-unmatch makes this a no-op on a clean repo.
+        if (self.repo / ".git").is_dir():
+            subprocess.run(
+                ["git", "rm", "--cached", "-q", "--ignore-unmatch", *DERIVED],
+                cwd=self.repo, capture_output=True,
+            )
 
     # -- index -------------------------------------------------------------
 
@@ -664,6 +697,40 @@ def selftest():
         mem.write("USER", "../../etc/passwd", "nope")
         assert not (repo.parent / "passwd").exists()
         assert list((repo / "USER_memory").glob("*.md"))
+
+    # DERIVED FILES NEVER ENTER GIT — the repo already has a .gitignore, the way one
+    # seeded from template/ does. The old code only wrote a .gitignore when none
+    # existed, so every real user repo committed the index and pushed it to GitHub.
+    with tempfile.TemporaryDirectory() as tmp:
+        repo = Path(tmp)
+        subprocess.run(["git", "init", "-q", str(repo)], check=True, capture_output=True)
+        subprocess.run(["git", "config", "user.email", "t@t"], cwd=repo, check=True)
+        subprocess.run(["git", "config", "user.name", "t"], cwd=repo, check=True)
+        (repo / ".gitignore").write_text(".git_credentials.json\n", encoding="utf-8")
+
+        mem = Memory(str(repo), create=True)
+        mem.capture("USER", "remember: Alice likes coffee")
+        mem.commit("selftest")
+
+        tracked = subprocess.run(["git", "ls-files"], cwd=repo,
+                                 capture_output=True, text=True).stdout.split()
+        for name in DERIVED:
+            assert name not in tracked, f"{name} was committed"
+        assert "USER_memory/alice-likes-coffee.md" in tracked, tracked
+        assert ".git_credentials.json" in (repo / ".gitignore").read_text(), \
+            "appending clobbered the entries the template already had"
+
+        # already-tracked index: .gitignore alone cannot fix that, it must be untracked
+        subprocess.run(["git", "add", "-f", INDEX_FILE], cwd=repo, capture_output=True)
+        subprocess.run(["git", "commit", "-q", "-m", "oops"], cwd=repo, capture_output=True)
+        assert INDEX_FILE in subprocess.run(["git", "ls-files"], cwd=repo,
+                                            capture_output=True, text=True).stdout.split()
+        (repo / ".gitignore").write_text(".git_credentials.json\n", encoding="utf-8")
+        Memory(str(repo)).commit("after migration")
+        tracked = subprocess.run(["git", "ls-files"], cwd=repo,
+                                 capture_output=True, text=True).stdout.split()
+        assert INDEX_FILE not in tracked, "reopening must untrack an already-committed index"
+        assert (repo / INDEX_FILE).exists(), "--cached must leave the file on disk"
 
     print("gitmem selftest OK")
 

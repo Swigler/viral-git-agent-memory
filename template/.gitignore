@@ -3,3 +3,7 @@
 .consolidation.lock
 .git_credentials.json
 __pycache__/
+index.sqlite3
+index.sqlite3-wal
+index.sqlite3-shm
+.gitmem.lock
