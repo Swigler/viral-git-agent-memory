@@ -66,6 +66,8 @@ viral-git-agent-memory/
 │   ├── USER_memory/
 │   ├── SOUL_memory/
 │   └── .gitignore
+├── gitmem.py          # Search: SQLite FTS5 index derived from the markdown
+├── bench.py           # 28k-memory scale check
 ├── stress_test.py     # Load testing
 └── test_100msg.py     # 100-message conversation test
 ```
@@ -249,6 +251,56 @@ used, 02.09.26
 ```
 
 Memories are **never deleted** — unused ones sink via recency. When a buried topic resurfaces, it jumps back. The `used` stamps track access frequency.
+
+## Search — `gitmem.py`
+
+Ranking by pinned → use-count → recency means the agent recalls what is **popular**, never what is **relevant**. `gitmem.py` adds full-text search over the same files, so it can answer "what do I know about X".
+
+**The markdown stays the truth. The index is derived** — SQLite FTS5, gitignored, rebuilt from the files in under six seconds. Delete it and you lose nothing. There is deliberately no vector store: a HNSW index under this exact write pattern (small incremental adds, one memory at a time) inflated from 233 KB to 399 GB in twenty minutes. That failure class is structurally absent here.
+
+Still zero dependencies — `sqlite3` is stdlib.
+
+```python
+from gitmem import Memory
+
+mem = Memory("~/memory/alice")
+
+mem.recall("USER", "where do they live")   # relevance-ranked, drop-in for load_top_memories()
+mem.recall("SOUL")                          # behavioural memory: always-loaded, never filtered
+mem.capture("USER", "remember: the standup is at 9am")   # manual capture, no model
+mem.search("coffee", "USER")                # raw hits with scores
+mem.commit()                                # regenerate index blocks + one git commit
+```
+
+`sync()` runs on open and reconciles the index with whatever is on disk, so `memory_hook.py` keeps writing files exactly as before without knowing the index exists.
+
+### USER is searched, SOUL is always loaded
+
+**USER memory is factual** — unbounded, and the user asks about it directly. Search is the right tool.
+
+**SOUL memory is behavioural** — small, bounded, and never asked about. It just has to be in the prompt. So `recall()` ignores the query for SOUL: a rule like "no hedging" must reach the prompt whether the user says "stop hedging" or "just answer me". Search there only *appears* to work when the user happens to use the memory's own words.
+
+### Measured at 28,000 memories
+
+`python bench.py` — the incremental write pattern, at scale:
+
+| | |
+|---|---|
+| markdown files | 8.3 MB (the truth, git-tracked) |
+| FTS5 index | 17.6 MB (derived, gitignored) — 2.11x, linear growth |
+| search | 29–40 ms |
+| full reindex from files | 5.6 s |
+| write throughput | ~400/s |
+| total repo on disk | 42.7 MB |
+
+### The honest limit
+
+Keyword search cannot cross a vocabulary gap. Ask about a memory in words it does not contain and you get **nothing back** — asserted in the selftest, not hidden. An earlier version returned the *wrong* memory at a confident 0.7 score, because stopwords matched every document. A miss beats a confident wrong answer. Closing that gap needs embeddings, and that is the point to add them.
+
+```bash
+python gitmem.py    # selftest
+python bench.py     # 28k scale check
+```
 
 ## Concurrency & Reliability
 
