@@ -64,6 +64,7 @@ from memory_hook import (  # noqa: F401 — push_to_github is re-exported for me
     push_to_github,
     save_git_credentials,
 )
+from gitmem import INDEX_BEGIN, INDEX_END  # the generated block assemble_context strips
 
 # --- LLM Provider Config (same env vars as memory_hook.py) ---
 LLM_PROVIDER = os.environ.get("MEMORY_LLM_PROVIDER", "").lower()
@@ -218,30 +219,60 @@ def assemble_context(repo: Path, state: dict) -> list[dict]:
     3. USER.md (who they are)
     4. USER_memory/ top N (what we know about them)
     5. history (last N turns)
+
+    Two optional keys change how step 2 and 4 are filled:
+      state["memory"] — an open gitmem.Memory, so memories are pulled relevance-first
+                        against state["query"] instead of by recency alone.
+      state["memories"] — False loads no memories at all. That is the expired tier:
+                        the agent still talks and still accepts manual captures, it
+                        just stops recalling on its own.
     """
+    memory = state.get("memory")
+    query = state.get("query") or ""
+
+    def _profile(text: str) -> str:
+        """The hand-written half of SOUL.md / USER.md, without the generated index.
+
+        gitmem appends a "## Index" block listing every memory with a 160-char
+        summary. It is navigation for a human reading the repo on GitHub. Injected
+        into the prompt it restates every fact a second time — and it put the whole
+        memory set in front of the model even when recall was switched off.
+        """
+        start, end = text.find(INDEX_BEGIN), text.find(INDEX_END)
+        if start == -1 or end == -1:
+            return text
+        return (text[:start] + text[end + len(INDEX_END):]).strip()
+
+    def _memories(kind: str) -> str:
+        if state.get("memories", True) is False:
+            return ""
+        if memory is not None:
+            return memory.recall(kind, query)
+        return load_top_memories(repo, f"{kind}_memory")
+
     # 1. SOUL base
     soul = repo / "SOUL.md"
     soul_legacy = repo / "character.md"
     soul_text = ""
     if soul.exists():
-        soul_text = soul.read_text(encoding="utf-8")
+        soul_text = _profile(soul.read_text(encoding="utf-8"))
     elif soul_legacy.exists():
-        soul_text = soul_legacy.read_text(encoding="utf-8")
+        soul_text = _profile(soul_legacy.read_text(encoding="utf-8"))
 
     # 2. SOUL adaptations
-    soul_memories = load_top_memories(repo, "SOUL_memory")
+    soul_memories = _memories("SOUL")
 
     # 3. User profile
     user_f = repo / "USER.md"
     user_legacy = repo / "user.md"
     user_profile = ""
     if user_f.exists():
-        user_profile = user_f.read_text(encoding="utf-8")
+        user_profile = _profile(user_f.read_text(encoding="utf-8"))
     elif user_legacy.exists():
-        user_profile = user_legacy.read_text(encoding="utf-8")
+        user_profile = _profile(user_legacy.read_text(encoding="utf-8"))
 
     # 4. User memories
-    user_memories = load_top_memories(repo, "USER_memory")
+    user_memories = _memories("USER")
 
     # Build system prompt
     system_parts = []

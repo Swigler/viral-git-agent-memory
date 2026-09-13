@@ -186,6 +186,10 @@ def call_openai(system_prompt: str, user_content: str, creds: dict | None = None
     `creds` overrides the module-level env config for one call: {"api_key", "api_url",
     "model"}. That is what lets one process serve many users on their own keys instead
     of a single tenant configured at startup.
+
+    `model` may be a LIST, which OpenRouter reads as a fallback chain in priority
+    order ("models"). Anything else gets the single "model" field every other
+    OpenAI-compatible provider expects.
     """
     creds = creds or {}
     api_key = creds.get("api_key") or OPENAI_API_KEY
@@ -195,8 +199,9 @@ def call_openai(system_prompt: str, user_content: str, creds: dict | None = None
         _log("[error] no API key — neither creds nor OPENAI_API_KEY")
         return ""
 
+    which = {"models": list(model)} if isinstance(model, (list, tuple)) else {"model": model}
     payload = json.dumps({
-        "model": model,
+        **which,
         "temperature": 0.2,
         "max_tokens": 2048,
         "response_format": {"type": "json_object"},
