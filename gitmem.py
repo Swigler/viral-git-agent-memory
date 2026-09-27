@@ -110,6 +110,17 @@ def slug_from(fact: str) -> str:
     return safe_slug("-".join(words[:5]) or fact.lower())
 
 
+def _drop_section(text: str, name: str) -> str:
+    """Remove every `## <name>` section (header line through the next `## `)."""
+    out, skip = [], False
+    for line in text.splitlines():
+        if line.startswith("## "):
+            skip = re.fullmatch(rf"## {re.escape(name)}[ \t]*", line) is not None
+        if not skip:
+            out.append(line)
+    return "\n".join(out).strip("\n")
+
+
 def render(slug: str, fact: str, episode: str = "", pinned: bool = False,
            access_log: str = "") -> str:
     """Render a memory file exactly as viral-git's write_memory_file does."""
@@ -137,6 +148,18 @@ def parse(text: str) -> dict:
         sections[current] = "\n".join(buf).strip()
 
     log = sections.get("Access log", "")
+
+    # Everything after the Access-log section: the Contradicted marker and any
+    # section a user or another tool appended by hand. render() only models
+    # Fact/Pinned/Episode/log, so write() re-appends this verbatim — without it
+    # an update silently dropped those sections, erasing contradiction markers
+    # and contradicting the docstring above.
+    tail = ""
+    m = re.search(r"^## Access log[ \t]*\n", text, re.M)
+    if m:
+        nxt = re.search(r"^## ", text[m.end():], re.M)
+        if nxt:
+            tail = text[m.end() + nxt.start():].strip("\n")
     return {
         "fact": sections.get("Fact", ""),
         "episode": sections.get("Episode", ""),
@@ -144,6 +167,7 @@ def parse(text: str) -> dict:
         "contradicted": "Contradicted" in sections,
         "used": sum(1 for ln in log.splitlines() if ln.strip().startswith("used,")),
         "access_log": f"## Access log\n{log}" if log else "",
+        "tail": tail,
     }
 
 
@@ -345,11 +369,18 @@ class Memory:
         with _lock(self.repo):
             # Preserve the access log across updates, as update_memory_file does.
             existing = parse(file.read_text(encoding="utf-8")) if file.exists() else {}
-            file.write_text(
-                render(slug, fact, episode, pinned or existing.get("pinned", False),
-                       existing.get("access_log", "")),
-                encoding="utf-8",
-            )
+            out = render(slug, fact, episode, pinned or existing.get("pinned", False),
+                         existing.get("access_log", ""))
+            # Re-append hand-added sections render() doesn't model, so an update
+            # doesn't silently erase them — but NOT "## Contradicted": writing a
+            # fact means it was just refined, so it is valid again. That is the
+            # rule memory_hook.update_memory_file applies (pass 2 #21, whose
+            # docstring names this method as the reference). Keeping the marker
+            # made the freshly written fact invisible to search and recall.
+            tail = _drop_section(existing.get("tail", ""), "Contradicted")
+            if tail:
+                out = out.rstrip("\n") + "\n\n" + tail + "\n"
+            file.write_text(out, encoding="utf-8")
             self._index(memory_type, file, file.stat().st_mtime)
             self.db.commit()
         return slug
@@ -632,6 +663,19 @@ def selftest():
         mem.sync()
         assert mem.search("idle timeout billing", "USER") == []
         assert path.exists() and mem.count("USER") == 3
+
+        # ...and updating a memory keeps hand-appended sections render() doesn't
+        # model, while clearing Contradicted: a rewritten fact is valid again
+        # (same rule as memory_hook.update_memory_file) and must be findable.
+        path.write_text(path.read_text() + "\n## Notes\nkeep me\n", encoding="utf-8")
+        mem.write("USER", "runpod-idle", "Runpod idle timeout billing changed again")
+        updated = path.read_text()
+        assert "## Notes\nkeep me" in updated, "hand-added section lost on update"
+        assert "## Contradicted" not in updated, "stale contradiction survived a rewrite"
+        assert "changed again" in updated and updated.count("## Access log") == 1
+        mem.sync()
+        assert mem.search("idle timeout billing", "USER")[0]["slug"] == "runpod-idle", \
+            "rewritten fact still hidden from search"
 
         # THE POINT: the index is derived. Delete it, everything comes back.
         before = mem.recall("USER", "chroma disk")

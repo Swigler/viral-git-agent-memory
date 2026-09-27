@@ -234,8 +234,13 @@ Server health check.
 | `OLLAMA_URL` | No | `http://localhost:11434` | Ollama base URL |
 | `OLLAMA_MODEL` | No | `qwen3.5:4b` | Model name |
 | `MEMORY_DIR` | No | `~/memory` | Where user repos live |
-| `API_KEY` | No | — | Bearer token for client auth |
+| `API_KEY` | If `HOST` is not loopback | — | Bearer token for client auth. The server refuses to bind a non-loopback address without it. |
+| `HOST` | No | `127.0.0.1` | Bind address. Set `0.0.0.0` (plus `API_KEY`) for remote clients. |
+| `CORS_ORIGINS` | No | `*` if `API_KEY` set, else none | Comma-separated browser origins allowed to call the API, or `*`. Requires `API_KEY` — the server refuses to start with `CORS_ORIGINS` and no key. |
+| `ALLOWED_HOSTS` | No | — | Keyless servers only answer requests whose `Host` header is a loopback name (DNS-rebinding guard). List extra hostnames here, e.g. a reverse proxy's. Ignored when `API_KEY` is set. |
 | `PORT` | No | `3100` | Server port |
+
+All `POST` bodies must be sent with `Content-Type: application/json` (max 10 MB).
 
 ## Memory File Format
 

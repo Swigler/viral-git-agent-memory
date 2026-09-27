@@ -36,10 +36,21 @@ Env vars:
     OLLAMA_URL           — base URL for Ollama (default: http://localhost:11434)
     OLLAMA_MODEL         — model name (default: qwen3.5:4b)
     MEMORY_DIR           — where user repos live (default: ~/memory)
-    API_KEY              — optional Bearer token for client auth
+    API_KEY              — Bearer token for client auth (required unless HOST is loopback)
+    HOST                 — bind address (default: 127.0.0.1). Binding a non-loopback
+                           address without API_KEY is refused at startup.
+    CORS_ORIGINS         — comma-separated browser origins allowed to call the API,
+                           or "*". Default: "*" when API_KEY is set, none otherwise
+                           (so web pages you visit can't drive a keyless local server).
+                           Setting this without API_KEY is refused at startup.
+    ALLOWED_HOSTS        — extra Host header names a keyless server answers to
+                           (comma-separated), e.g. a reverse-proxy hostname.
+                           Loopback names are always allowed; ignored with API_KEY.
     PORT                 — server port (default: 3100)
 """
+import hmac
 import http.server
+import ipaddress
 import json
 import os
 import re
@@ -59,6 +70,9 @@ from socketserver import ThreadingMixIn
 # a second copy is a second thing to remember to fix.
 from memory_hook import (  # noqa: F401 — push_to_github is re-exported for memory-bot/loop.py
     GITHUB_REMOTE,
+    GIT_CMD_TIMEOUT,
+    GIT_PUSH_TIMEOUT,
+    _find_access_log,
     git_auth,
     load_git_credentials,
     push_to_github,
@@ -79,7 +93,13 @@ OLLAMA_MODEL = os.environ.get("OLLAMA_MODEL", "qwen3.5:4b")
 MEMORY_DIR = Path(os.environ.get("MEMORY_DIR", str(Path.home() / "memory")))
 TEMPLATE_DIR = Path(__file__).parent / "template"
 PORT = int(os.environ.get("PORT", "3100"))
+HOST = os.environ.get("HOST", "127.0.0.1")
 API_KEY = os.environ.get("API_KEY", "")
+_cors_env = os.environ.get("CORS_ORIGINS")
+if _cors_env is None:
+    _cors_env = "*" if API_KEY else ""
+CORS_ORIGINS = {o.strip() for o in _cors_env.split(",") if o.strip()}
+ALLOWED_HOSTS = {h.strip().lower() for h in os.environ.get("ALLOWED_HOSTS", "").split(",") if h.strip()}
 
 # How many USER_memory / SOUL_memory files to load into context
 TOP_N_MEMORIES = 10
@@ -91,6 +111,15 @@ CONSOLIDATE_EVERY = 30
 # Per-user working state (in-memory, dies on restart)
 _user_state: dict[str, dict] = {}
 _state_lock = threading.Lock()
+
+# Per-user request serialization for /v1/chat — see _chat_locked.
+_chat_locks: dict[str, threading.Lock] = {}
+_chat_locks_guard = threading.Lock()
+
+
+def _chat_lock(user_id: str) -> threading.Lock:
+    with _chat_locks_guard:
+        return _chat_locks.setdefault(user_id, threading.Lock())
 
 # Inactivity timer: fires consolidation after 10 min silence
 INACTIVITY_SECONDS = 600
@@ -119,8 +148,14 @@ def _safe_user_id(user_id: str) -> str:
 
 
 def get_user_repo(user_id: str) -> Path:
-    """Get or create a user's memory repo."""
-    user_id = _safe_user_id(user_id)
+    """Get or create a user's memory repo.
+
+    Expects an already-sanitized id — handlers must run _safe_user_id() at the
+    request boundary. The id keys in-memory state, consolidation timers and the
+    on-disk repo; sanitizing only some of those meant two raw ids that fold to
+    the same safe id ("a/b" and "a_b") shared one repo with separate histories.
+    """
+    user_id = _safe_user_id(user_id)  # idempotent — belt and braces
     repo = MEMORY_DIR / user_id
     if repo.exists():
         return repo
@@ -142,14 +177,32 @@ def get_user_repo(user_id: str) -> Path:
             )
             (repo / "USER_memory").mkdir(exist_ok=True)
             (repo / "SOUL_memory").mkdir(exist_ok=True)
+            # No template means no .gitignore either — without one, the next
+            # `git add -A` commits transcripts, the credentials file and the
+            # SQLite index, and the mirror push ships them all to GitHub.
+            # Keep this in sync with template/.gitignore.
+            (repo / ".gitignore").write_text(
+                ".transcript_*.jsonl\n"
+                ".consolidation.log\n"
+                ".consolidation.lock\n"
+                ".git_credentials.json\n"
+                "__pycache__/\n"
+                "index.sqlite3\n"
+                "index.sqlite3-wal\n"
+                "index.sqlite3-shm\n"
+                ".gitmem.lock\n"
+            )
 
-        # Git init
-        subprocess.run(["git", "init"], cwd=repo, capture_output=True)
-        subprocess.run(["git", "add", "-A"], cwd=repo, capture_output=True)
+        # Git init — bounded like every other git call; a wedged git here used
+        # to hang the request thread (holding _repo_lock) forever. A timeout
+        # surfaces as a 500 instead, which the client can retry.
+        subprocess.run(["git", "init"], cwd=repo, capture_output=True, timeout=GIT_CMD_TIMEOUT)
+        subprocess.run(["git", "add", "-A"], cwd=repo, capture_output=True, timeout=GIT_CMD_TIMEOUT)
         subprocess.run(
             ["git", "commit", "-m", "init"],
             cwd=repo,
             capture_output=True,
+            timeout=GIT_CMD_TIMEOUT,
             env={
                 **os.environ,
                 "GIT_AUTHOR_NAME": "memory-server",
@@ -183,16 +236,20 @@ def load_top_memories(repo: Path, memory_type: str, n: int = TOP_N_MEMORIES) -> 
 
     def _use_count_and_recency(filepath: Path) -> tuple[int, int, float]:
         content = filepath.read_text(encoding="utf-8")
-        # Pinned memories always sort first
-        pinned = 1 if "## Pinned" in content else 0
-        # Only count 'used,' lines in the Access log section, not in fact/episode text
-        log_marker = "## Access log"
-        log_idx = content.find(log_marker)
+        # Pinned memories always sort first. Full header line only, like
+        # gitmem.parse() and memory_hook._is_pinned — a fact that merely
+        # mentions "## Pinned" mid-text must not pin the file.
+        pinned = 1 if re.search(r"^## Pinned[ \t]*$", content, re.M) else 0
+        # Only count 'used,' lines in the Access log section, not in fact/episode
+        # text — and only below a real "## Access log" header line. A fact that
+        # merely contains the phrase mid-sentence ("see ## Access log etiquette")
+        # used to flip the substring find() and get its whole tail scanned.
         count = 0
+        log_idx = _find_access_log(content)
         if log_idx != -1:
             log_section = content[log_idx:]
             # Stop at next section if any
-            next_section = re.search(r"\n## (?!Access log)", log_section)
+            next_section = re.search(r"\n## (?!Access log[ \t]*\n)", log_section)
             if next_section:
                 log_section = log_section[:next_section.start()]
             count = sum(1 for line in log_section.splitlines() if line.strip().startswith("used,"))
@@ -482,11 +539,16 @@ def reset_inactivity_timer(user_id: str):
 
         def on_inactive():
             log(f"[inactivity] 10 min idle for {user_id}, triggering consolidation")
-            with _state_lock:
-                state = _user_state.get(user_id)
-            if state and state["history"]:
-                repo = get_user_repo(user_id)
-                trigger_consolidation(user_id, repo, state)
+            # This is a third consolidation trigger next to /v1/chat and /v1/bye,
+            # so it takes the same per-user chat lock — an in-flight chat holding
+            # the lock delays the timer thread instead of racing the hook's repo
+            # rewrite. Lock order matches _chat_locked (chat → state), no cycle.
+            with _chat_lock(user_id):
+                with _state_lock:
+                    state = _user_state.get(user_id)
+                if state and state["history"]:
+                    repo = get_user_repo(user_id)
+                    trigger_consolidation(user_id, repo, state)
 
         timer = threading.Timer(INACTIVITY_SECONDS, on_inactive)
         timer.daemon = True
@@ -594,34 +656,47 @@ def setup_github_remote(repo: Path, token: str, repo_name: str | None = None) ->
     # No credentials in the URL — git_auth supplies them per command instead.
     remote_url = f"https://x-access-token@github.com/{gh_username}/{repo_name}.git"
 
-    with git_auth(token) as env:
-        # 3. Point the github remote at it, leaving origin (the memory store) alone.
-        subprocess.run(
-            ["git", "remote", "remove", GITHUB_REMOTE], cwd=repo, capture_output=True
-        )
-        result = subprocess.run(
-            ["git", "remote", "add", GITHUB_REMOTE, remote_url],
-            cwd=repo, capture_output=True, text=True,
-        )
-        if result.returncode != 0:
-            return {"ok": False, "error": f"Failed to set git remote: {result.stderr.strip()[:100]}"}
+    try:
+        with git_auth(token) as env:
+            # Every git call is time-bounded: this whole handler runs inside the
+            # HTTP request thread, so a hung git (credential prompt, stuck
+            # network) used to wedge that thread — and the user's chat lock —
+            # forever. GIT_TERMINAL_PROMPT=0 comes from git_auth's env.
+            subprocess.run(
+                ["git", "remote", "remove", GITHUB_REMOTE], cwd=repo,
+                capture_output=True, timeout=GIT_CMD_TIMEOUT,
+            )
+            result = subprocess.run(
+                ["git", "remote", "add", GITHUB_REMOTE, remote_url],
+                cwd=repo, capture_output=True, text=True, timeout=GIT_CMD_TIMEOUT,
+            )
+            if result.returncode != 0:
+                return {"ok": False, "error": f"Failed to set git remote: {result.stderr.strip()[:100]}"}
 
-        # 4. Initial push. Ensure there's at least one commit first.
-        subprocess.run(["git", "add", "-A"], cwd=repo, capture_output=True, env=env)
-        subprocess.run(
-            ["git", "commit", "-m", "init memory vault", "--allow-empty"],
-            cwd=repo, capture_output=True, text=True, env=env,
-        )
-        branch = subprocess.run(
-            ["git", "branch", "--show-current"], cwd=repo, capture_output=True, text=True,
-        )
-        branch_name = branch.stdout.strip() or "main"
-        # No -u: the upstream stays the memory store, so a later bare `git push`
-        # (memory_hook.git_commit does exactly that) still goes there and not here.
-        push = subprocess.run(
-            ["git", "push", GITHUB_REMOTE, branch_name],
-            cwd=repo, capture_output=True, text=True, env=env,
-        )
+            # 4. Initial push. Ensure there's at least one commit first.
+            subprocess.run(
+                ["git", "add", "-A"], cwd=repo, capture_output=True, env=env,
+                timeout=GIT_CMD_TIMEOUT,
+            )
+            subprocess.run(
+                ["git", "commit", "-m", "init memory vault", "--allow-empty"],
+                cwd=repo, capture_output=True, text=True, env=env,
+                timeout=GIT_CMD_TIMEOUT,
+            )
+            branch = subprocess.run(
+                ["git", "branch", "--show-current"], cwd=repo,
+                capture_output=True, text=True, timeout=GIT_CMD_TIMEOUT,
+            )
+            branch_name = branch.stdout.strip() or "main"
+            # No -u: the upstream stays the memory store, so a later bare `git push`
+            # (memory_hook.git_commit does exactly that) still goes there and not here.
+            push = subprocess.run(
+                ["git", "push", GITHUB_REMOTE, branch_name],
+                cwd=repo, capture_output=True, text=True, env=env,
+                timeout=GIT_PUSH_TIMEOUT,
+            )
+    except subprocess.TimeoutExpired:
+        return {"ok": False, "error": f"git timed out during GitHub setup (>{GIT_CMD_TIMEOUT}s) — try again"}
     if push.returncode != 0:
         return {"ok": False, "error": f"Repo created but push failed: {push.stderr.strip()[:200]}"}
 
@@ -643,31 +718,119 @@ def setup_github_remote(repo: Path, token: str, repo_name: str | None = None) ->
 # --- HTTP Handler ---
 
 
+# Request bodies are JSON control messages — anything bigger is an accident or
+# an attack. Uncapped rfile.read() let one POST exhaust server memory.
+MAX_BODY_BYTES = 10 * 1024 * 1024
+
+
+def _host_header_ok(host_header: str | None) -> bool:
+    """DNS-rebinding guard for a keyless server.
+
+    Loopback is not authentication. A web page on evil.example can re-point its
+    own hostname at 127.0.0.1; the browser then treats this server as
+    same-origin, so no CORS or Content-Type rule applies, and the page can
+    drive every endpoint — including /v1/git/setup with the attacker's GitHub
+    token, which pushes the user's whole memory repo to the attacker. What the
+    page cannot change is the Host header: it stays "evil.example". So a
+    keyless server only answers to loopback names (plus ALLOWED_HOSTS). With
+    API_KEY set the Bearer secret already covers this.
+    """
+    if API_KEY:
+        return True
+    if not host_header:
+        return True  # browsers always send Host; this is a bare HTTP/1.0 client
+    h = host_header.strip().lower()
+    if h.startswith("["):  # [::1]:3100
+        name = h[1 : h.index("]")] if "]" in h else h
+    elif h.count(":") == 1:  # 127.0.0.1:3100, localhost:3100
+        name = h.split(":", 1)[0]
+    else:
+        name = h
+    name = name.rstrip(".")
+    return _is_loopback(name) or name in ALLOWED_HOSTS
+
+
 class ChatHandler(http.server.BaseHTTPRequestHandler):
     def log_message(self, format, *args):
         # Suppress default request logging
         pass
 
+    def _check_host(self) -> bool:
+        if _host_header_ok(self.headers.get("Host")):
+            return True
+        self.send_error(403, "Host not allowed")
+        return False
+
+    def _read_json_body(self) -> dict | None:
+        """Read and parse a JSON request body with a hard size cap.
+
+        Returns the parsed dict, or None after sending the error response.
+        """
+        try:
+            content_length = int(self.headers.get("Content-Length", 0))
+        except ValueError:
+            self.send_error(400, "Invalid Content-Length")
+            return None
+        # Negative lengths must be rejected too: rfile.read(-1) reads until
+        # EOF with no limit, which bypassed the cap entirely.
+        if content_length < 0:
+            self.send_error(400, "Invalid Content-Length")
+            return None
+        if content_length > MAX_BODY_BYTES:
+            self.send_error(413, "Request body too large")
+            return None
+        # Browsers can send text/plain POSTs cross-site with no CORS preflight.
+        # Requiring application/json forces a preflight, which CORS_ORIGINS gates.
+        ctype = self.headers.get("Content-Type", "").split(";", 1)[0].strip().lower()
+        if ctype != "application/json":
+            self.send_error(415, "Content-Type must be application/json")
+            return None
+        body = self.rfile.read(content_length)
+        try:
+            data = json.loads(body)
+        except json.JSONDecodeError:
+            self.send_error(400, "Invalid JSON")
+            return None
+        if not isinstance(data, dict):
+            self.send_error(400, "JSON body must be an object")
+            return None
+        return data
+
     def _check_auth(self) -> bool:
         if not API_KEY:
             return True
         auth = self.headers.get("Authorization", "")
-        if auth == f"Bearer {API_KEY}":
+        if hmac.compare_digest(auth.encode(), f"Bearer {API_KEY}".encode()):
             return True
         self.send_error(401, "Unauthorized")
         return False
 
     def _cors_headers(self):
-        self.send_header("Access-Control-Allow-Origin", "*")
+        # No CORS headers at all unless the origin is allowed — a keyless
+        # server must not let arbitrary web pages read or drive it.
+        if not CORS_ORIGINS:
+            return
+        origin = self.headers.get("Origin", "")
+        if "*" in CORS_ORIGINS:
+            self.send_header("Access-Control-Allow-Origin", "*")
+        elif origin in CORS_ORIGINS:
+            self.send_header("Access-Control-Allow-Origin", origin)
+            self.send_header("Vary", "Origin")
+        else:
+            return
         self.send_header("Access-Control-Allow-Methods", "GET, POST, OPTIONS")
         self.send_header("Access-Control-Allow-Headers", "Content-Type, Authorization")
 
     def do_OPTIONS(self):
+        if not self._check_host():
+            return
         self.send_response(204)
         self._cors_headers()
         self.end_headers()
 
     def do_GET(self):
+        if not self._check_host():
+            return
         if self.path == "/health":
             self.send_response(200)
             self.send_header("Content-Type", "application/json")
@@ -684,6 +847,8 @@ class ChatHandler(http.server.BaseHTTPRequestHandler):
         self.send_error(404)
 
     def do_POST(self):
+        if not self._check_host():
+            return
         if self.path == "/v1/bye":
             return self._handle_bye()
         if self.path == "/v1/consolidate":
@@ -699,17 +864,17 @@ class ChatHandler(http.server.BaseHTTPRequestHandler):
         if not self._check_auth():
             return
 
-        # Read body
-        content_length = int(self.headers.get("Content-Length", 0))
-        body = self.rfile.read(content_length)
-        try:
-            data = json.loads(body)
-        except json.JSONDecodeError:
-            self.send_error(400, "Invalid JSON")
+        data = self._read_json_body()
+        if data is None:
             return
 
-        message = data.get("message", "").strip()
-        user_id = str(data.get("userId", "anonymous"))
+        raw_message = data.get("message", "")
+        if not isinstance(raw_message, str):
+            self.send_error(400, "message must be a string")
+            return
+        message = raw_message.strip()
+        # Sanitize at the boundary: this id keys state, timers AND the repo dir.
+        user_id = _safe_user_id(str(data.get("userId", "anonymous")))
 
         if not message:
             self.send_error(400, "Empty message")
@@ -717,6 +882,19 @@ class ChatHandler(http.server.BaseHTTPRequestHandler):
 
         log(f"[chat] user={user_id} msg={message[:80]}...")
 
+        # Serialize per user: ThreadingMixIn serves each request on its own
+        # thread, so two fast messages from one user would otherwise interleave.
+        # The rest runs in _chat_locked, holding the user's lock end to end.
+        with _chat_lock(user_id):
+            self._chat_locked(user_id, message)
+
+    def _chat_locked(self, user_id: str, message: str):
+        """Body of /v1/chat, run under the per-user lock.
+
+        daemon.py's handlers got per-user locks in pass 1 for exactly this:
+        interleaved history appends and a double-fired consolidation when two
+        requests for one user race.
+        """
         # Get/create user repo and state
         repo = get_user_repo(user_id)
         state = get_user_state(user_id)
@@ -778,15 +956,12 @@ class ChatHandler(http.server.BaseHTTPRequestHandler):
         if not self._check_auth():
             return
 
-        content_length = int(self.headers.get("Content-Length", 0))
-        body = self.rfile.read(content_length)
-        try:
-            data = json.loads(body)
-        except json.JSONDecodeError:
-            self.send_error(400, "Invalid JSON")
+        data = self._read_json_body()
+        if data is None:
             return
 
-        user_id = str(data.get("userId", "anonymous"))
+        # Sanitize at the boundary: this id keys state, timers AND the repo dir.
+        user_id = _safe_user_id(str(data.get("userId", "anonymous")))
         log(f"[bye] user={user_id}")
 
         # Cancel inactivity timer
@@ -795,17 +970,19 @@ class ChatHandler(http.server.BaseHTTPRequestHandler):
             if timer:
                 timer.cancel()
 
-        # Trigger consolidation if there's history
-        with _state_lock:
-            state = _user_state.get(user_id)
+        # Trigger consolidation if there's history. Take the per-user chat
+        # lock so /bye can't clear history out from under a streaming /v1/chat.
         did_consolidate = False
-        if state and state["history"]:
-            repo = get_user_repo(user_id)
-            trigger_consolidation(user_id, repo, state)
-            did_consolidate = True
-            # Clear history so reconnection starts fresh
-            state["history"] = []
-            state["message_count"] = 0
+        with _chat_lock(user_id):
+            with _state_lock:
+                state = _user_state.get(user_id)
+            if state and state["history"]:
+                repo = get_user_repo(user_id)
+                trigger_consolidation(user_id, repo, state)
+                did_consolidate = True
+                # Clear history so reconnection starts fresh
+                state["history"] = []
+                state["message_count"] = 0
 
         self.send_response(200)
         self.send_header("Content-Type", "application/json")
@@ -819,16 +996,16 @@ class ChatHandler(http.server.BaseHTTPRequestHandler):
         if not self._check_auth():
             return
 
-        content_length = int(self.headers.get("Content-Length", 0))
-        body = self.rfile.read(content_length)
-        try:
-            data = json.loads(body)
-        except json.JSONDecodeError:
-            self.send_error(400, "Invalid JSON")
+        data = self._read_json_body()
+        if data is None:
             return
 
-        user_id = str(data.get("userId", "anonymous"))
+        # Sanitize at the boundary: this id keys state, timers AND the repo dir.
+        user_id = _safe_user_id(str(data.get("userId", "anonymous")))
         transcript_msgs = data.get("transcript", [])
+        if not isinstance(transcript_msgs, list):
+            self.send_error(400, "transcript must be a list")
+            return
 
         if not transcript_msgs:
             self.send_response(200)
@@ -885,21 +1062,24 @@ class ChatHandler(http.server.BaseHTTPRequestHandler):
         if not self._check_auth():
             return
 
-        content_length = int(self.headers.get("Content-Length", 0))
-        body = self.rfile.read(content_length)
-        try:
-            data = json.loads(body)
-        except json.JSONDecodeError:
-            self.send_error(400, "Invalid JSON")
+        data = self._read_json_body()
+        if data is None:
             return
 
-        user_id = str(data.get("userId", "")).strip()
+        raw_user_id = str(data.get("userId", "")).strip()
         github_token = str(data.get("githubToken", "")).strip()
         repo_name = data.get("repoName")  # optional
+        # A non-string (e.g. {"repoName": {}}) reached re.sub() after the GitHub
+        # calls and crashed the handler thread — the client got a dropped
+        # connection instead of an error. Reject it before any network call.
+        if repo_name is not None and not isinstance(repo_name, str):
+            self.send_error(400, "repoName must be a string")
+            return
 
-        if not user_id:
+        if not raw_user_id:
             self.send_error(400, "userId required")
             return
+        user_id = _safe_user_id(raw_user_id)
         if not github_token:
             self.send_error(400, "githubToken required")
             return
@@ -924,14 +1104,14 @@ class ChatHandler(http.server.BaseHTTPRequestHandler):
         from urllib.parse import urlparse, parse_qs
         parsed = urlparse(self.path)
         params = parse_qs(parsed.query)
-        user_id = params.get("userId", [""])[0].strip()
+        raw_user_id = params.get("userId", [""])[0].strip()
 
-        if not user_id:
+        if not raw_user_id:
             self.send_error(400, "userId query param required")
             return
 
-        safe_id = _safe_user_id(user_id)
-        repo = MEMORY_DIR / safe_id
+        user_id = _safe_user_id(raw_user_id)
+        repo = MEMORY_DIR / user_id
 
         response = {"userId": user_id, "connected": False}
 
@@ -963,6 +1143,15 @@ class ThreadedHTTPServer(ThreadingMixIn, http.server.HTTPServer):
     daemon_threads = True
 
 
+def _is_loopback(host: str) -> bool:
+    if host == "localhost":
+        return True
+    try:
+        return ipaddress.ip_address(host).is_loopback
+    except ValueError:
+        return False
+
+
 def main():
     port = PORT
     if "--port" in sys.argv:
@@ -983,6 +1172,28 @@ def main():
     model_name = {"openai": OPENAI_MODEL, "anthropic": ANTHROPIC_MODEL, "ollama": OLLAMA_MODEL}[LLM_PROVIDER]
     llm_url = {"openai": OPENAI_API_URL, "anthropic": ANTHROPIC_API_URL, "ollama": OLLAMA_URL}[LLM_PROVIDER]
 
+    if not API_KEY and not _is_loopback(HOST):
+        print(
+            f"ERROR: refusing to bind {HOST} without API_KEY — every endpoint (chat,\n"
+            "consolidation, GitHub token setup) would be open to anyone who can reach\n"
+            "this port. Set API_KEY, or use HOST=127.0.0.1.",
+            file=sys.stderr,
+        )
+        sys.exit(1)
+
+    # CORS on a keyless server is a contradiction: with no Bearer secret to
+    # check, an allowed origin (or "*" ) lets any web page you visit — or a DNS
+    # rebinding — read and drive the API from your browser. Refuse the combo;
+    # explicitly setting CORS_ORIGINS without API_KEY is never what you want.
+    if CORS_ORIGINS and not API_KEY:
+        print(
+            "ERROR: CORS_ORIGINS is set but API_KEY is not — that lets arbitrary\n"
+            "web pages drive this server (including via DNS rebinding to loopback).\n"
+            "Set API_KEY, or unset CORS_ORIGINS.",
+            file=sys.stderr,
+        )
+        sys.exit(1)
+
     MEMORY_DIR.mkdir(parents=True, exist_ok=True)
     log(f"viral-git-agent-memory API server")
     log(f"  port:       {port}")
@@ -990,12 +1201,14 @@ def main():
     log(f"  provider:   {LLM_PROVIDER}")
     log(f"  model:      {model_name}")
     log(f"  llm_url:    {llm_url}")
+    log(f"  host:       {HOST}")
     log(f"  auth:       {'enabled' if API_KEY else 'disabled'}")
+    log(f"  cors:       {', '.join(sorted(CORS_ORIGINS)) or 'none'}")
     log(f"  template:   {TEMPLATE_DIR}")
     log(f"  consolidate every {CONSOLIDATE_EVERY} messages")
     log(f"")
 
-    server = ThreadedHTTPServer(("0.0.0.0", port), ChatHandler)
+    server = ThreadedHTTPServer((HOST, port), ChatHandler)
     try:
         server.serve_forever()
     except KeyboardInterrupt:

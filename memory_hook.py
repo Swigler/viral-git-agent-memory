@@ -480,30 +480,82 @@ def write_memory_file(repo_path: str, memory_type: str, slug: str, fact: str, ep
     content += f"## Fact\n{fact}\n\n"
     if pinned:
         content += f"## Pinned\ncritical\n\n"
-    content += f"## Episode\n{episode}\n\n"
+    # Match gitmem.render(): no empty Episode section — it only adds noise to
+    # the FTS index and the two writers should stay byte-compatible.
+    if episode:
+        content += f"## Episode\n{episode}\n\n"
     content += f"## Access log\nused, {today}\n"
     filepath.write_text(content, encoding="utf-8")
 
 
+# "## Access log" must be located as a real header line, not a substring — the
+# same rule _is_pinned got in pass 2 (#22). A fact or episode that merely
+# mentions "## Access log" mid-text used to move where stamps were counted and
+# inserted, silently losing uses from the popularity ranking.
+_ACCESS_LOG_RE = re.compile(r"^## Access log[ \t]*$", re.M)
+
+
+def _find_access_log(content: str) -> int:
+    """Offset of the Access log header line, or -1."""
+    m = _ACCESS_LOG_RE.search(content)
+    return m.start() if m else -1
+
+
+def _stamp_used(content: str, today: str) -> str:
+    """Append a `used,` stamp INSIDE the ## Access log section.
+
+    Stamps used to be appended at end of file — after a ## Contradicted section
+    when one existed, where neither memory_hook's own _count_used_stamps nor
+    gitmem's parse() ever counts them. Popularity ranking silently lost those
+    uses.
+    """
+    log_idx = _find_access_log(content)
+    if log_idx == -1:
+        return content.rstrip() + "\n\n## Access log\nused, " + today + "\n"
+    next_section = re.search(r"\n## (?!Access log)", content[log_idx:])
+    if next_section:
+        split = log_idx + next_section.start()
+        log_section, tail = content[:split], content[split:]
+        return log_section.rstrip() + f"\nused, {today}\n" + tail
+    return content.rstrip() + f"\nused, {today}\n"
+
+
 def update_memory_file(repo_path: str, memory_type: str, slug: str, fact: str, episode: str):
-    """Update an existing memory file with new info."""
+    """Update an existing memory file with new info.
+
+    Rewrites fact + episode while preserving the sections that carry state:
+    the access log (popularity ranking) and `## Pinned`. The pin used to be
+    silently dropped here — an allergy or other safety-critical memory lost its
+    always-load status the first time an UPDATE decision refined it.
+
+    `## Contradicted` is deliberately cleared: an UPDATE means the fact was just
+    refined with fresh information, so it is valid again. Keeping the marker
+    made a corrected memory keep sinking, and diverged from gitmem.write(),
+    which never re-emits it.
+    """
     slug = _safe_slug(slug)
     mem_dir = Path(repo_path) / memory_type
     filepath = mem_dir / f"{slug}.md"
     today = date.today().strftime("%d.%m.%y")
 
     if filepath.exists():
-        # Rewrite fact + episode, keep access log
         content = filepath.read_text(encoding="utf-8")
-        # Find and preserve access log
-        log_marker = "## Access log"
-        log_idx = content.find(log_marker)
-        access_log = content[log_idx:] if log_idx != -1 else f"{log_marker}\n"
+        # Preserve the access log and any unknown trailing sections, minus
+        # the Contradicted marker (see docstring).
+        log_idx = _find_access_log(content)
+        access_log = content[log_idx:] if log_idx != -1 else "## Access log\n"
+        access_log = re.sub(r"\n*^## Contradicted[ \t]*\n(?:(?!## ).*(?:\n|$))*",
+                            "\n", access_log, flags=re.M)
+        pinned = _is_pinned(content)
 
         new_content = f"# {slug.replace('-', ' ').title()}\n\n"
         new_content += f"## Fact\n{fact}\n\n"
-        new_content += f"## Episode\n{episode}\n\n"
-        new_content += access_log.rstrip() + f"\nused, {today}\n"
+        if pinned:
+            new_content += "## Pinned\ncritical\n\n"
+        if episode:
+            new_content += f"## Episode\n{episode}\n\n"
+        new_content += access_log.rstrip() + "\n"
+        new_content = _stamp_used(new_content, today)
         filepath.write_text(new_content, encoding="utf-8")
     else:
         _log(f"[warn] UPDATE target '{slug}' not found on disk — creating as new file")
@@ -529,8 +581,7 @@ def mark_contradicted(repo_path: str, memory_type: str, slug: str):
 
 def _count_used_stamps(content: str) -> int:
     """Count 'used,' lines only in the Access log section, not in fact/episode text."""
-    log_marker = "## Access log"
-    log_idx = content.find(log_marker)
+    log_idx = _find_access_log(content)
     if log_idx == -1:
         return 0
     log_section = content[log_idx:]
@@ -542,8 +593,12 @@ def _count_used_stamps(content: str) -> int:
 
 
 def _is_pinned(content: str) -> bool:
-    """Check if a memory file has a ## Pinned section."""
-    return "## Pinned" in content
+    """Check if a memory file has a ## Pinned section header.
+
+    Matches only a real header line, like gitmem.parse() does — a fact or
+    episode that merely mentions "## Pinned" mid-line must not pin the file.
+    """
+    return re.search(r"^## Pinned[ \t]*$", content, re.M) is not None
 
 
 def _use_count_and_recency(filepath: Path) -> tuple[int, int, float]:
@@ -622,6 +677,13 @@ def git_auth(token: str):
         os.unlink(helper)
 
 
+# Hard ceilings for git subprocesses. A stalled network push used to block the
+# consolidation worker forever — holding the per-user flock, so every later
+# consolidation for that user queued behind it and the transcript piled up.
+GIT_CMD_TIMEOUT = int(os.environ.get("GIT_CMD_TIMEOUT", "60"))
+GIT_PUSH_TIMEOUT = int(os.environ.get("GIT_PUSH_TIMEOUT", "120"))
+
+
 def push_to_github(repo: Path, token: str | None = None) -> bool:
     """Mirror the repo to the user's GitHub. Returns False if GitHub isn't connected.
 
@@ -632,17 +694,24 @@ def push_to_github(repo: Path, token: str | None = None) -> bool:
     token = token or load_git_credentials(repo).get("token", "")
     if not token:
         return False
-    remotes = subprocess.run(["git", "remote"], cwd=repo, capture_output=True, text=True)
-    if GITHUB_REMOTE not in remotes.stdout.split():
-        return False
-    branch = subprocess.run(
-        ["git", "branch", "--show-current"], cwd=repo, capture_output=True, text=True,
-    )
-    with git_auth(token) as env:
-        push = subprocess.run(
-            ["git", "push", GITHUB_REMOTE, branch.stdout.strip() or "main"],
-            cwd=repo, capture_output=True, text=True, env=env,
+    try:
+        remotes = subprocess.run(["git", "remote"], cwd=repo, capture_output=True,
+                                 text=True, timeout=GIT_CMD_TIMEOUT)
+        if GITHUB_REMOTE not in remotes.stdout.split():
+            return False
+        branch = subprocess.run(
+            ["git", "branch", "--show-current"], cwd=repo, capture_output=True,
+            text=True, timeout=GIT_CMD_TIMEOUT,
         )
+        with git_auth(token) as env:
+            push = subprocess.run(
+                ["git", "push", GITHUB_REMOTE, branch.stdout.strip() or "main"],
+                cwd=repo, capture_output=True, text=True, env=env,
+                timeout=GIT_PUSH_TIMEOUT,
+            )
+    except subprocess.TimeoutExpired:
+        _log("[github] mirror push timed out — giving up this round")
+        return False
     if push.returncode != 0:
         _log(f"[github] mirror push failed: {push.stderr.strip()[:200]}")
     else:
@@ -659,32 +728,46 @@ def git_commit(repo_path: str):
 
     env = {
         **os.environ,
+        # Never let an unauthenticated remote drop git into an interactive
+        # credential prompt — under a daemon that hangs the worker, not fails it.
+        "GIT_TERMINAL_PROMPT": "0",
         "GIT_AUTHOR_NAME": "memory-hook",
         "GIT_AUTHOR_EMAIL": "hook@viral-git-agent-memory",
         "GIT_COMMITTER_NAME": "memory-hook",
         "GIT_COMMITTER_EMAIL": "hook@viral-git-agent-memory",
     }
-    subprocess.run(["git", "add", "-A"], cwd=repo, capture_output=True, env=env)
-    result = subprocess.run(
-        ["git", "commit", "-m", f"checkpoint {date.today().strftime('%d.%m.%y')}"],
-        cwd=repo, capture_output=True, text=True, env=env,
-    )
+    try:
+        subprocess.run(["git", "add", "-A"], cwd=repo, capture_output=True, env=env,
+                       timeout=GIT_CMD_TIMEOUT)
+        result = subprocess.run(
+            ["git", "commit", "-m", f"checkpoint {date.today().strftime('%d.%m.%y')}"],
+            cwd=repo, capture_output=True, text=True, env=env, timeout=GIT_CMD_TIMEOUT,
+        )
+    except subprocess.TimeoutExpired:
+        _log("[git] add/commit timed out — skipping this round")
+        return
     if result.returncode == 0:
         _log(f"[git] committed: {result.stdout.strip().splitlines()[0]}")
         # Push if remote exists
         has_remote = subprocess.run(
             ["git", "remote"], cwd=repo, capture_output=True, text=True,
+            timeout=GIT_CMD_TIMEOUT,
         )
         if has_remote.stdout.strip():
-            push = subprocess.run(
-                ["git", "push"], cwd=repo, capture_output=True, text=True, env=env,
-            )
-            if push.returncode == 0:
-                _log("[git] pushed")
+            try:
+                push = subprocess.run(
+                    ["git", "push"], cwd=repo, capture_output=True, text=True, env=env,
+                    timeout=GIT_PUSH_TIMEOUT,
+                )
+            except subprocess.TimeoutExpired:
+                _log("[git] push timed out — will retry on the next consolidation")
             else:
-                # Sanitize stderr to avoid logging tokens from remote URL
-                err_msg = re.sub(r'https://[^@]+@', 'https://***@', push.stderr.strip()[:100])
-                _log(f"[git] push failed: {err_msg}")
+                if push.returncode == 0:
+                    _log("[git] pushed")
+                else:
+                    # Sanitize stderr to avoid logging tokens from remote URL
+                    err_msg = re.sub(r'https://[^@]+@', 'https://***@', push.stderr.strip()[:100])
+                    _log(f"[git] push failed: {err_msg}")
     else:
         # "nothing to commit" goes to STDOUT, not stderr — checking stderr alone
         # reported every no-op consolidation as a hard failure.
@@ -806,8 +889,7 @@ def _consolidate_inner(repo_path: str, transcript: str, creds: dict | None = Non
                     mem_file = Path(repo_path) / "USER_memory" / f"{target}.md"
                     if mem_file.exists():
                         content = mem_file.read_text(encoding="utf-8")
-                        content += f"\nused, {today}"
-                        mem_file.write_text(content, encoding="utf-8")
+                        mem_file.write_text(_stamp_used(content, today), encoding="utf-8")
                     _log(f"[user] NONE: {d['target_slug']}")
 
     # --- Step 3+4: A.U.D.N. for agent memories ---
@@ -856,8 +938,7 @@ def _consolidate_inner(repo_path: str, transcript: str, creds: dict | None = Non
                     mem_file = Path(repo_path) / "SOUL_memory" / f"{target}.md"
                     if mem_file.exists():
                         content = mem_file.read_text(encoding="utf-8")
-                        content += f"\nused, {today}"
-                        mem_file.write_text(content, encoding="utf-8")
+                        mem_file.write_text(_stamp_used(content, today), encoding="utf-8")
                     _log(f"[agent] NONE: {d['target_slug']}")
 
     # --- Step 5: Git commit ---
@@ -898,13 +979,17 @@ def main():
             _log("[error] empty transcript")
             sys.exit(1)
 
-        consolidate(repo_path, transcript)
-
-        # Clean up temp transcript file
         try:
-            Path(transcript_path).unlink(missing_ok=True)
-        except OSError:
-            pass
+            consolidate(repo_path, transcript)
+        finally:
+            # Clean up the temp transcript on failure too — it lives INSIDE the
+            # repo, so a leftover is committed (and mirror-pushed) by the next
+            # consolidation's `git add -A` on any repo without the template's
+            # .gitignore. Raw chat history is exactly what must not leak there.
+            try:
+                Path(transcript_path).unlink(missing_ok=True)
+            except OSError:
+                pass
 
     elif cmd == "--test":
         repo_path = sys.argv[2]
