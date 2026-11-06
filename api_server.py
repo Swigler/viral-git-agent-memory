@@ -54,31 +54,30 @@ import ipaddress
 import json
 import os
 import re
-import shutil
 import subprocess
 import sys
+import tempfile
 import threading
-import time
-import urllib.request
-import urllib.error
-from datetime import date, datetime
+from datetime import datetime
 from pathlib import Path
 from socketserver import ThreadingMixIn
+from urllib.parse import parse_qs, urlparse
+import urllib.error
+import urllib.request
 
-# Git and GitHub-credential handling lives in memory_hook: it owns git_commit, so the
-# mirror push happens there for every consolidation path. One home for the auth code —
-# a second copy is a second thing to remember to fix.
-from memory_hook import (  # noqa: F401 — push_to_github is re-exported for memory-bot/loop.py
-    GITHUB_REMOTE,
+# Git and GitHub-credential handling lives in gitops (shared with memory_hook), the
+# repo initializer in memory_hook.init_repo, the markdown format and search in gitmem.
+from gitmem import DEFAULT_N, INDEX_BEGIN, INDEX_END, Memory
+from gitops import (
     GIT_CMD_TIMEOUT,
     GIT_PUSH_TIMEOUT,
-    _find_access_log,
+    GITHUB_REMOTE,
     git_auth,
     load_git_credentials,
-    push_to_github,
+    push_to_github,  # noqa: F401 — public API, imported by Swigler/memory-bot loop.py
     save_git_credentials,
 )
-from gitmem import INDEX_BEGIN, INDEX_END  # the generated block assemble_context strips
+from memory_hook import TEMPLATE_DIR, init_repo
 
 # --- LLM Provider Config (same env vars as memory_hook.py) ---
 LLM_PROVIDER = os.environ.get("MEMORY_LLM_PROVIDER", "").lower()
@@ -91,7 +90,6 @@ ANTHROPIC_MODEL = os.environ.get("ANTHROPIC_MODEL", "claude-sonnet-4-20250514")
 OLLAMA_URL = os.environ.get("OLLAMA_URL", "http://localhost:11434").rstrip("/")
 OLLAMA_MODEL = os.environ.get("OLLAMA_MODEL", "qwen3.5:4b")
 MEMORY_DIR = Path(os.environ.get("MEMORY_DIR", str(Path.home() / "memory")))
-TEMPLATE_DIR = Path(__file__).parent / "template"
 PORT = int(os.environ.get("PORT", "3100"))
 HOST = os.environ.get("HOST", "127.0.0.1")
 API_KEY = os.environ.get("API_KEY", "")
@@ -101,8 +99,6 @@ if _cors_env is None:
 CORS_ORIGINS = {o.strip() for o in _cors_env.split(",") if o.strip()}
 ALLOWED_HOSTS = {h.strip().lower() for h in os.environ.get("ALLOWED_HOSTS", "").split(",") if h.strip()}
 
-# How many USER_memory / SOUL_memory files to load into context
-TOP_N_MEMORIES = 10
 # History: last N turns kept in working memory
 HISTORY_LIMIT = 16
 # Consolidation trigger: every N messages
@@ -134,83 +130,21 @@ def log(msg: str):
 # --- User Repo Management ---
 
 
-_repo_lock = threading.Lock()
-
-
 def _safe_user_id(user_id: str) -> str:
     """Sanitize user_id to prevent path traversal."""
-    # Strip path separators and dangerous characters
     safe = re.sub(r'[^a-zA-Z0-9_\-]', '_', user_id)
-    # Prevent empty or dot-only names
     if not safe or safe.startswith('.'):
         safe = f"user_{safe}"
     return safe[:64]  # cap length
 
 
 def get_user_repo(user_id: str) -> Path:
-    """Get or create a user's memory repo.
-
-    Expects an already-sanitized id — handlers must run _safe_user_id() at the
-    request boundary. The id keys in-memory state, consolidation timers and the
-    on-disk repo; sanitizing only some of those meant two raw ids that fold to
-    the same safe id ("a/b" and "a_b") shared one repo with separate histories.
-    """
-    user_id = _safe_user_id(user_id)  # idempotent — belt and braces
+    """Get or create a user's memory repo (atomic, race-safe: memory_hook.init_repo)."""
+    user_id = _safe_user_id(user_id)
     repo = MEMORY_DIR / user_id
-    if repo.exists():
-        return repo
-    with _repo_lock:
-        # Double-check after acquiring lock
-        if repo.exists():
-            return repo
+    if not repo.exists():
         log(f"[repo] creating new repo for {user_id}")
-        MEMORY_DIR.mkdir(parents=True, exist_ok=True)
-        if TEMPLATE_DIR.exists():
-            shutil.copytree(TEMPLATE_DIR, repo)
-        else:
-            repo.mkdir(parents=True)
-            (repo / "USER.md").write_text(
-                "# User Profile\n\n## Identity\n- User ID: no_one\n"
-            )
-            (repo / "SOUL.md").write_text(
-                "# SOUL\n\nBase persona.\n"
-            )
-            (repo / "USER_memory").mkdir(exist_ok=True)
-            (repo / "SOUL_memory").mkdir(exist_ok=True)
-            # No template means no .gitignore either — without one, the next
-            # `git add -A` commits transcripts, the credentials file and the
-            # SQLite index, and the mirror push ships them all to GitHub.
-            # Keep this in sync with template/.gitignore.
-            (repo / ".gitignore").write_text(
-                ".transcript_*.jsonl\n"
-                ".consolidation.log\n"
-                ".consolidation.lock\n"
-                ".git_credentials.json\n"
-                "__pycache__/\n"
-                "index.sqlite3\n"
-                "index.sqlite3-wal\n"
-                "index.sqlite3-shm\n"
-                ".gitmem.lock\n"
-            )
-
-        # Git init — bounded like every other git call; a wedged git here used
-        # to hang the request thread (holding _repo_lock) forever. A timeout
-        # surfaces as a 500 instead, which the client can retry.
-        subprocess.run(["git", "init"], cwd=repo, capture_output=True, timeout=GIT_CMD_TIMEOUT)
-        subprocess.run(["git", "add", "-A"], cwd=repo, capture_output=True, timeout=GIT_CMD_TIMEOUT)
-        subprocess.run(
-            ["git", "commit", "-m", "init"],
-            cwd=repo,
-            capture_output=True,
-            timeout=GIT_CMD_TIMEOUT,
-            env={
-                **os.environ,
-                "GIT_AUTHOR_NAME": "memory-server",
-                "GIT_AUTHOR_EMAIL": "server@viral-git-agent-memory",
-                "GIT_COMMITTER_NAME": "memory-server",
-                "GIT_COMMITTER_EMAIL": "server@viral-git-agent-memory",
-            },
-        )
+        init_repo(str(repo), user_id)
     return repo
 
 
@@ -220,7 +154,8 @@ def get_user_state(user_id: str) -> dict:
         if user_id not in _user_state:
             _user_state[user_id] = {
                 "message_count": 0,
-                "history": [],  # list of {"role": ..., "content": ...}
+                "history": [],  # chat window sent to the LLM: {"role", "content"}
+                "pending": [],  # everything since the last consolidation, never truncated
             }
         return _user_state[user_id]
 
@@ -228,44 +163,15 @@ def get_user_state(user_id: str) -> dict:
 # --- Context Assembly ---
 
 
-def load_top_memories(repo: Path, memory_type: str, n: int = TOP_N_MEMORIES) -> str:
-    """Load top N memory files sorted by use count (most used first), recency as tiebreaker."""
-    mem_dir = repo / memory_type
-    if not mem_dir.is_dir():
-        return ""
-
-    def _use_count_and_recency(filepath: Path) -> tuple[int, int, float]:
-        content = filepath.read_text(encoding="utf-8")
-        # Pinned memories always sort first. Full header line only, like
-        # gitmem.parse() and memory_hook._is_pinned — a fact that merely
-        # mentions "## Pinned" mid-text must not pin the file.
-        pinned = 1 if re.search(r"^## Pinned[ \t]*$", content, re.M) else 0
-        # Only count 'used,' lines in the Access log section, not in fact/episode
-        # text — and only below a real "## Access log" header line. A fact that
-        # merely contains the phrase mid-sentence ("see ## Access log etiquette")
-        # used to flip the substring find() and get its whole tail scanned.
-        count = 0
-        log_idx = _find_access_log(content)
-        if log_idx != -1:
-            log_section = content[log_idx:]
-            # Stop at next section if any
-            next_section = re.search(r"\n## (?!Access log[ \t]*\n)", log_section)
-            if next_section:
-                log_section = log_section[:next_section.start()]
-            count = sum(1 for line in log_section.splitlines() if line.strip().startswith("used,"))
-        return (pinned, count, filepath.stat().st_mtime)
-
-    files = sorted(mem_dir.glob("*.md"), key=_use_count_and_recency, reverse=True)
-    parts = []
-    for f in files[:n]:
-        content = f.read_text(encoding="utf-8").strip()
-        # Extract just the Fact section for context
-        fact_match = re.search(r"## Fact\n(.+?)(\n\n|\n##|$)", content, re.DOTALL)
-        if fact_match:
-            parts.append(f"- {fact_match.group(1).strip()}")
-        else:
-            parts.append(f"- {f.stem.replace('-', ' ')}")
-    return "\n".join(parts)
+def _memory(repo: Path, state: dict) -> Memory:
+    """The user's gitmem.Memory, opened once and kept in their state (it is only used
+    under the user's chat lock; Memory also serialises its own sqlite connection)."""
+    memory = state.get("memory")
+    if memory is None:
+        memory = state["memory"] = Memory(repo)
+    else:
+        memory.sync()  # the consolidation worker writes files from another process
+    return memory
 
 
 def assemble_context(repo: Path, state: dict) -> list[dict]:
@@ -277,14 +183,14 @@ def assemble_context(repo: Path, state: dict) -> list[dict]:
     4. USER_memory/ top N (what we know about them)
     5. history (last N turns)
 
-    Two optional keys change how step 2 and 4 are filled:
-      state["memory"] — an open gitmem.Memory, so memories are pulled relevance-first
-                        against state["query"] instead of by recency alone.
+    Memories come from gitmem.Memory (the derived FTS5 index, synced from the files on
+    every call, contradicted memories excluded). Optional state keys:
+      state["query"]    — the current user message: USER memories are pulled
+                          relevance-first against it, SOUL memories always load.
       state["memories"] — False loads no memories at all. That is the expired tier:
-                        the agent still talks and still accepts manual captures, it
-                        just stops recalling on its own.
+                          the agent still talks and still accepts manual captures, it
+                          just stops recalling on its own.
     """
-    memory = state.get("memory")
     query = state.get("query") or ""
 
     def _profile(text: str) -> str:
@@ -303,9 +209,7 @@ def assemble_context(repo: Path, state: dict) -> list[dict]:
     def _memories(kind: str) -> str:
         if state.get("memories", True) is False:
             return ""
-        if memory is not None:
-            return memory.recall(kind, query)
-        return load_top_memories(repo, f"{kind}_memory")
+        return _memory(repo, state).recall(kind, query, DEFAULT_N)
 
     # 1. SOUL base
     soul = repo / "SOUL.md"
@@ -539,16 +443,13 @@ def reset_inactivity_timer(user_id: str):
 
         def on_inactive():
             log(f"[inactivity] 10 min idle for {user_id}, triggering consolidation")
-            # This is a third consolidation trigger next to /v1/chat and /v1/bye,
-            # so it takes the same per-user chat lock — an in-flight chat holding
-            # the lock delays the timer thread instead of racing the hook's repo
-            # rewrite. Lock order matches _chat_locked (chat → state), no cycle.
+            # Same per-user chat lock as /v1/chat and /v1/bye, so an in-flight chat
+            # delays this thread instead of racing it. Lock order: chat -> state.
             with _chat_lock(user_id):
                 with _state_lock:
                     state = _user_state.get(user_id)
-                if state and state["history"]:
-                    repo = get_user_repo(user_id)
-                    trigger_consolidation(user_id, repo, state)
+                if state and state["pending"]:
+                    consolidate_pending(user_id, get_user_repo(user_id), state)
 
         timer = threading.Timer(INACTIVITY_SECONDS, on_inactive)
         timer.daemon = True
@@ -556,37 +457,47 @@ def reset_inactivity_timer(user_id: str):
         _inactivity_timers[user_id] = timer
 
 
-def trigger_consolidation(user_id: str, repo: Path, state: dict):
-    """Fire the consolidation hook in the background."""
-    log(f"[consolidate] triggering for {user_id} at message {state['message_count']}")
+def spawn_consolidation(user_id: str, repo: Path, messages: list[dict]):
+    """Write `messages` to a private transcript file and start memory_hook.py on it.
 
-    # Write working history to a temp transcript file
-    transcript_path = repo / f".transcript_{int(time.time()*1000)}.jsonl"
-    with open(transcript_path, "w", encoding="utf-8") as f:
-        for msg in state["history"]:
+    The one trigger path for /v1/chat (every N messages), /v1/bye, the inactivity
+    timer and /v1/consolidate. The worker is a subprocess: it takes the repo lock, so
+    concurrent triggers for one user queue up instead of racing, and a crash cannot
+    take the server down. A reaper thread wait()s on it so it never lingers as a zombie.
+    """
+    fd, path = tempfile.mkstemp(prefix=".transcript_", suffix=".jsonl", dir=repo)
+    with os.fdopen(fd, "w", encoding="utf-8") as f:
+        for msg in messages:
             f.write(json.dumps({"message": msg}) + "\n")
 
-    # Run memory_hook.py --consolidate in background
-    hook_script = Path(__file__).parent / "memory_hook.py"
-    if hook_script.exists():
-        log_file = repo / ".consolidation.log"
-        fh = open(log_file, "a", encoding="utf-8")
-        subprocess.Popen(
-            [
-                sys.executable,
-                str(hook_script),
-                "--consolidate",
-                str(repo),
-                user_id,
-                str(transcript_path),
-            ],
-            stdout=fh,
-            stderr=fh,
-            start_new_session=True,
+    with open(repo / ".consolidation.log", "a", encoding="utf-8") as logfh:
+        proc = subprocess.Popen(
+            [sys.executable, str(Path(__file__).parent / "memory_hook.py"),
+             "--consolidate", str(repo), user_id, path],
+            stdout=logfh, stderr=logfh, start_new_session=True,
         )
-        fh.close()
-    else:
-        log(f"[consolidate] memory_hook.py not found at {hook_script}")
+    threading.Thread(target=proc.wait, daemon=True).start()
+    log(f"[consolidate] started for {user_id}: {len(messages)} messages")
+
+
+def consolidate_pending(user_id: str, repo: Path, state: dict, reset_history: bool = False):
+    """Consolidate everything said since the last consolidation, exactly once.
+
+    Snapshots and clears the unconsolidated buffer under the caller's chat lock, so
+    nothing is consolidated twice and nothing is skipped — whichever trigger fires.
+    Caller holds the user's chat lock.
+    """
+    snapshot, state["pending"] = state["pending"], []
+    state["message_count"] = 0
+    if reset_history:
+        state["history"] = []
+    if not snapshot:
+        return
+    try:
+        spawn_consolidation(user_id, repo, snapshot)
+    except Exception:
+        state["pending"] = snapshot + state["pending"]  # put it back for the next trigger
+        raise
 
 
 # --- GitHub Integration ---
@@ -895,61 +806,59 @@ class ChatHandler(http.server.BaseHTTPRequestHandler):
         interleaved history appends and a double-fired consolidation when two
         requests for one user race.
         """
-        # Get/create user repo and state
         repo = get_user_repo(user_id)
         state = get_user_state(user_id)
+        state["query"] = message
 
-        # Add user message to history
-        state["history"].append({"role": "user", "content": message})
-        state["message_count"] += 1
-
-        # Assemble full context
+        # Tentatively record the user turn; it is dropped again if the model fails,
+        # so history never holds an orphan user turn.
+        turn = {"role": "user", "content": message}
+        state["history"].append(turn)
         messages = assemble_context(repo, state)
-        # Add the current message (it's already in history, which is in messages)
 
-        # Stream response
         self.send_response(200)
         self.send_header("Content-Type", "text/event-stream")
         self.send_header("Cache-Control", "no-cache")
         self._cors_headers()
         self.end_headers()
 
-        full_response = ""
+        full_response, failed = "", False
         try:
             for chunk in stream_llm(messages):
                 self.wfile.write(chunk.encode())
                 self.wfile.flush()
-
-                # Extract token from chunk for history
                 if chunk.startswith("data: ") and chunk.strip() != "data: [DONE]":
                     try:
                         parsed = json.loads(chunk[6:])
-                        token = parsed.get("choices", [{}])[0].get("delta", {}).get("content", "")
-                        if token:
-                            full_response += token
-                    except (json.JSONDecodeError, IndexError, KeyError):
-                        pass
+                    except json.JSONDecodeError:
+                        continue
+                    if not isinstance(parsed, dict):
+                        continue
+                    if "error" in parsed:
+                        failed = True
+                    delta = (parsed.get("choices") or [{}])[0].get("delta", {})
+                    full_response += delta.get("content", "") or ""
         except (BrokenPipeError, ConnectionResetError):
             log(f"[chat] client disconnected for {user_id}")
 
-        # Save assistant response to history
-        if full_response:
+        if not full_response:
+            state["history"].remove(turn)  # model failed or client left: no orphan turn
+        else:
             state["history"].append({"role": "assistant", "content": full_response})
+            state["pending"] += [turn, state["history"][-1]]
+            state["message_count"] += 1
 
-        # Cap history to prevent unbounded memory growth
-        # Keep 2x HISTORY_LIMIT so consolidation has enough context
-        max_history = HISTORY_LIMIT * 2
-        if len(state["history"]) > max_history:
-            state["history"] = state["history"][-max_history:]
+        # Keep the window bounded, and never starting with an assistant turn
+        # (Anthropic rejects that forever once it is in history).
+        state["history"] = state["history"][-HISTORY_LIMIT * 2:]
+        while state["history"] and state["history"][0]["role"] != "user":
+            state["history"].pop(0)
 
-        # Check consolidation trigger (every 30 messages)
-        if state["message_count"] % CONSOLIDATE_EVERY == 0:
-            trigger_consolidation(user_id, repo, state)
-
-        # Reset inactivity timer (fires after 10 min silence)
+        if state["message_count"] >= CONSOLIDATE_EVERY:
+            consolidate_pending(user_id, repo, state)
         reset_inactivity_timer(user_id)
 
-        log(f"[chat] done user={user_id} msgs={state['message_count']} response_len={len(full_response)}")
+        log(f"[chat] done user={user_id} msgs={state['message_count']} response_len={len(full_response)} failed={failed}")
 
     def _handle_bye(self):
         """Handle /v1/bye — trigger consolidation and clean up."""
@@ -976,13 +885,10 @@ class ChatHandler(http.server.BaseHTTPRequestHandler):
         with _chat_lock(user_id):
             with _state_lock:
                 state = _user_state.get(user_id)
-            if state and state["history"]:
-                repo = get_user_repo(user_id)
-                trigger_consolidation(user_id, repo, state)
-                did_consolidate = True
-                # Clear history so reconnection starts fresh
-                state["history"] = []
-                state["message_count"] = 0
+            if state:
+                did_consolidate = bool(state["pending"])
+                # Clears history too, so reconnection starts fresh
+                consolidate_pending(user_id, get_user_repo(user_id), state, reset_history=True)
 
         self.send_response(200)
         self.send_header("Content-Type", "application/json")
@@ -1017,34 +923,7 @@ class ChatHandler(http.server.BaseHTTPRequestHandler):
 
         log(f"[consolidate] received {len(transcript_msgs)} messages for {user_id}")
 
-        # Get/create user repo
-        repo = get_user_repo(user_id)
-
-        # Import and run consolidation directly (same process, background thread)
-        hook_script = Path(__file__).parent / "memory_hook.py"
-        if hook_script.exists():
-            # Write transcript to temp file for memory_hook
-            transcript_path = repo / f".transcript_{int(time.time()*1000)}.jsonl"
-            with open(transcript_path, "w", encoding="utf-8") as f:
-                for msg in transcript_msgs:
-                    f.write(json.dumps({"message": msg}) + "\n")
-
-            log_file = repo / ".consolidation.log"
-            fh2 = open(log_file, "a", encoding="utf-8")
-            subprocess.Popen(
-                [
-                    sys.executable,
-                    str(hook_script),
-                    "--consolidate",
-                    str(repo),
-                    user_id,
-                    str(transcript_path),
-                ],
-                stdout=fh2,
-                stderr=fh2,
-                start_new_session=True,
-            )
-            fh2.close()
+        spawn_consolidation(user_id, get_user_repo(user_id), transcript_msgs)
 
         self.send_response(200)
         self.send_header("Content-Type", "application/json")
@@ -1101,7 +980,6 @@ class ChatHandler(http.server.BaseHTTPRequestHandler):
             return
 
         # Parse userId from query string
-        from urllib.parse import urlparse, parse_qs
         parsed = urlparse(self.path)
         params = parse_qs(parsed.query)
         raw_user_id = params.get("userId", [""])[0].strip()

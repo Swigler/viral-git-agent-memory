@@ -1,6 +1,6 @@
 # viral-git-agent-memory
 
-Brain-inspired memory system for AI agents. Git-native, human-readable, zero dependencies.
+Brain-inspired memory system for AI agents. Git-native, human-readable, stdlib-only (POSIX: uses `fcntl` file locks, so Linux/macOS, not Windows).
 
 Every user gets their own git repo of markdown files. The agent learns who you are (USER memory) and how to talk to you (SOUL memory) — and you can `git log` the entire history.
 
@@ -59,14 +59,15 @@ Inspired by [Mem0](https://github.com/mem0ai/mem0). For each extracted fact, com
 ```
 viral-git-agent-memory/
 ├── api_server.py      # HTTP server: /v1/chat (SSE), /v1/bye, /v1/git/setup, /health
-├── memory_hook.py     # Consolidation engine: extraction, A.U.D.N., git commit
+├── memory_hook.py     # Consolidation engine: extraction, A.U.D.N., index blocks, git commit
+├── gitops.py          # Shared: repo lock, atomic writes, git, GitHub credentials, repo init
 ├── template/          # Blank user repo skeleton
 │   ├── SOUL.md        # Base persona (nanobot-compatible naming)
 │   ├── USER.md        # User profile
 │   ├── USER_memory/
 │   ├── SOUL_memory/
 │   └── .gitignore
-├── gitmem.py          # Search: SQLite FTS5 index derived from the markdown
+├── gitmem.py          # Markdown format + every file writer + SQLite FTS5 index (search, ranking)
 ├── bench.py           # 28k-memory scale check
 ├── stress_test.py     # Load testing
 └── test_100msg.py     # 100-message conversation test
@@ -89,13 +90,16 @@ Each user gets their own repo:
 
 ## Status
 
-This project is **built and code-reviewed but not yet production-tested or personally tested with real conversations**. The architecture is solid, the code has been through multiple review passes and has a 58-assertion test suite covering every code path, but it hasn't been battle-tested with real users yet. Expect rough edges.
+This project is **built and code-reviewed but not yet production-tested or personally tested with real conversations**. The architecture is solid, the code has been through multiple review passes and has an offline test suite (see Tests), but it hasn't been battle-tested with real users yet. Expect rough edges.
 
 ### Tests
 
 ```bash
-# Offline test suite — 62 assertions, no API key needed
+# Offline test suite for the file layer — 63 assertions, no API key needed
 python stress_test.py
+
+# gitmem selftest (index, search, capture, git)
+python gitmem.py
 
 # GitHub credential + mirror-push checks (no network, local bare repos stand in)
 python test_github_auth.py
@@ -121,7 +125,7 @@ Example test output (offline, no LLM):
   ✅ common-fact ranked highest (5 uses)
   ✅ new commit created
   ✅ memory survives re-init
-  RESULTS: 58 passed, 0 failed
+  RESULTS: 63 passed, 0 failed
 ```
 
 ## Quick Start
@@ -258,7 +262,7 @@ used, 31.08.26
 used, 02.09.26
 ```
 
-Memories are **never deleted** — unused ones sink via recency. When a buried topic resurfaces, it jumps back. The `used` stamps track access frequency.
+The consolidation hook never deletes a memory file: a contradicted memory gets a `## Contradicted` section and drops out of recall (`git revert` always works). Unused ones sink in the ranking; when a buried topic resurfaces, it jumps back. The `used` stamps track access frequency. Only the explicit `Memory.delete()` API removes a file.
 
 ## Search — `gitmem.py`
 
@@ -312,11 +316,11 @@ python bench.py     # 28k scale check
 
 ## Concurrency & Reliability
 
-- **Per-user file locking** — `fcntl.flock` prevents concurrent consolidations from racing on `.md` files and git operations
+- **One per-repo lock** — `.gitmem.lock` (`fcntl.flock`, POSIX only, re-entrant within a thread) is taken by every writer: consolidation, `gitmem.Memory`, the GitHub setup. All file writes are atomic (temp file + `os.replace`).
 - **Slug collision handling** — if an ADD generates a slug that already exists on disk (or duplicates within the same batch), it auto-suffixes (`likes-coffee-2`, `likes-coffee-3`)
 - **Missing target warnings** — UPDATE/DELETE on a slug that doesn't exist on disk logs a `[warn]` instead of silently no-oping
 - **Git error detection** — distinguishes "nothing to commit" from real failures (disk full, identity misconfigured, index locked)
-- **Contradiction tracking** — the DELETE action marks memories as contradicted (they sink in ranking but are never destroyed, so `git revert` always works)
+- **Contradiction tracking** — the DELETE action marks memories as contradicted (excluded from recall and search, never destroyed, so `git revert` always works)
 
 ## Security
 
@@ -325,7 +329,7 @@ python bench.py     # 28k scale check
   throwaway `GIT_ASKPASS` helper, so it is in neither the remote URL (which would land
   in `.git/config` in plaintext and come back out in git's own error messages) nor
   `argv` (visible in `ps`)
-- **Token sanitization** — GitHub tokens never appear in logs or error responses
+- **Token handling** — the token is never in argv, the remote URL or `.git/config`; git's stderr (which cannot contain it) is truncated before it is logged or returned
 - **Credentials gitignored and 0600** — `.git_credentials.json` is created private and
   is never committed or pushed
 - **The mirror is a separate remote** — the user's GitHub is `github`, never `origin`,
