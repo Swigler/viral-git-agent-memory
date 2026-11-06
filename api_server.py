@@ -4,13 +4,13 @@
 # dependencies = []
 # ///
 """
-viral-git-agent-memory — API Server (Piece 2)
+viral-git-agent-memory — API Server
 
-The /v1/chat endpoint that Tonic Office Client calls.
-Streams LLM responses via SSE. Triggers consolidation hook.
+The /v1/chat endpoint: streams LLM responses via SSE with per-user memory in the
+prompt, and triggers the consolidation hook (every 30 messages, /v1/bye, 10 min idle).
 GitHub integration: users connect their own GitHub account, memories auto-push to their private repo.
 
-Zero dependencies — stdlib only.
+Stdlib only, POSIX only (file locks).
 
 Endpoints:
     POST /v1/chat          — stream a chat response (SSE)
@@ -36,18 +36,31 @@ Env vars:
     OLLAMA_URL           — base URL for Ollama (default: http://localhost:11434)
     OLLAMA_MODEL         — model name (default: qwen3.5:4b)
     MEMORY_DIR           — where user repos live (default: ~/memory)
-    API_KEY              — Bearer token for client auth (required unless HOST is loopback)
+    API_KEY_SECRET       — enables per-user auth: a caller must send
+                           "Authorization: Bearer <HMAC-SHA256(API_KEY_SECRET, userId)>"
+                           and can only act as that one userId. Mint a token with
+                           `python api_server.py --issue-token USER_ID`.
+    SINGLE_TENANT        — "1": instead use one shared API_KEY as the Bearer token for
+                           every userId (only for deployments with a single trusted client).
+    API_KEY              — the shared key for SINGLE_TENANT=1. Alone (without SINGLE_TENANT
+                           or API_KEY_SECRET) it is refused at startup.
     HOST                 — bind address (default: 127.0.0.1). Binding a non-loopback
-                           address without API_KEY is refused at startup.
+                           address without auth is refused at startup.
     CORS_ORIGINS         — comma-separated browser origins allowed to call the API,
-                           or "*". Default: "*" when API_KEY is set, none otherwise
+                           or "*". Default: "*" when auth is on, none otherwise
                            (so web pages you visit can't drive a keyless local server).
-                           Setting this without API_KEY is refused at startup.
+                           Setting this without auth is refused at startup.
     ALLOWED_HOSTS        — extra Host header names a keyless server answers to
                            (comma-separated), e.g. a reverse-proxy hostname.
-                           Loopback names are always allowed; ignored with API_KEY.
+                           Loopback names are always allowed; ignored with auth on.
     PORT                 — server port (default: 3100)
+    EMBED_URL, EMBED_MODEL, EMBED_API_KEY, EMBED_TIMEOUT — optional embeddings (gitmem.py)
+
+userId is required on every user-scoped endpoint: 1-128 characters of letters, digits
+and . _ @ : + - (first character alphanumeric). Each id maps to its own repo directory
+(<readable prefix>-<sha256 prefix>), so no two ids can ever share memory.
 """
+import hashlib
 import hmac
 import http.server
 import ipaddress
@@ -68,16 +81,20 @@ import urllib.request
 # Git and GitHub-credential handling lives in gitops (shared with memory_hook), the
 # repo initializer in memory_hook.init_repo, the markdown format and search in gitmem.
 from gitmem import DEFAULT_N, INDEX_BEGIN, INDEX_END, Memory
-from gitops import (
+from gitops import (  # noqa: F401 — push_to_github/git_auth are public API (Swigler/memory-bot loop.py)
     GIT_CMD_TIMEOUT,
-    GIT_PUSH_TIMEOUT,
     GITHUB_REMOTE,
+    GitError,
+    commit_all,
     git_auth,
     load_git_credentials,
-    push_to_github,  # noqa: F401 — public API, imported by Swigler/memory-bot loop.py
+    push_github,
+    push_to_github,
+    repo_lock,
+    run_git,
     save_git_credentials,
 )
-from memory_hook import TEMPLATE_DIR, init_repo
+from memory_hook import init_repo
 
 # --- LLM Provider Config (same env vars as memory_hook.py) ---
 LLM_PROVIDER = os.environ.get("MEMORY_LLM_PROVIDER", "").lower()
@@ -93,9 +110,19 @@ MEMORY_DIR = Path(os.environ.get("MEMORY_DIR", str(Path.home() / "memory")))
 PORT = int(os.environ.get("PORT", "3100"))
 HOST = os.environ.get("HOST", "127.0.0.1")
 API_KEY = os.environ.get("API_KEY", "")
+API_KEY_SECRET = os.environ.get("API_KEY_SECRET", "")
+SINGLE_TENANT = os.environ.get("SINGLE_TENANT", "").lower() in ("1", "true", "yes")
+SOCKET_TIMEOUT = float(os.environ.get("SOCKET_TIMEOUT", "60"))  # per client socket operation
+MAX_CONNECTIONS = int(os.environ.get("MAX_CONNECTIONS", "64"))
+
+
+def auth_enabled() -> bool:
+    return bool(API_KEY_SECRET or (SINGLE_TENANT and API_KEY))
+
+
 _cors_env = os.environ.get("CORS_ORIGINS")
 if _cors_env is None:
-    _cors_env = "*" if API_KEY else ""
+    _cors_env = "*" if auth_enabled() else ""
 CORS_ORIGINS = {o.strip() for o in _cors_env.split(",") if o.strip()}
 ALLOWED_HOSTS = {h.strip().lower() for h in os.environ.get("ALLOWED_HOSTS", "").split(",") if h.strip()}
 
@@ -104,20 +131,21 @@ HISTORY_LIMIT = 16
 # Consolidation trigger: every N messages
 CONSOLIDATE_EVERY = 30
 
-# Per-user working state (in-memory, dies on restart)
+# Per-user working state (in-memory, dies on restart; evicted when a user goes idle)
 _user_state: dict[str, dict] = {}
 _state_lock = threading.Lock()
 
-# Per-user request serialization for /v1/chat — see _chat_locked.
-_chat_locks: dict[str, threading.Lock] = {}
-_chat_locks_guard = threading.Lock()
+# Per-user request serialization (chat, bye, inactivity timer). A fixed pool of locks
+# picked by hash: bounded memory, nothing to evict. ponytail: two users that hash to the
+# same stripe serialise behind each other; raise the pool size if that ever shows.
+_CHAT_LOCKS = [threading.Lock() for _ in range(1024)]
 
 
 def _chat_lock(user_id: str) -> threading.Lock:
-    with _chat_locks_guard:
-        return _chat_locks.setdefault(user_id, threading.Lock())
+    return _CHAT_LOCKS[int(hashlib.sha256(user_id.encode()).hexdigest()[:8], 16) % len(_CHAT_LOCKS)]
 
-# Inactivity timer: fires consolidation after 10 min silence
+
+# Inactivity timer: fires consolidation after 10 min silence, then evicts the user's state
 INACTIVITY_SECONDS = 600
 _inactivity_timers: dict[str, threading.Timer] = {}
 _timer_lock = threading.Lock()
@@ -130,22 +158,65 @@ def log(msg: str):
 # --- User Repo Management ---
 
 
-def _safe_user_id(user_id: str) -> str:
-    """Sanitize user_id to prevent path traversal."""
-    safe = re.sub(r'[^a-zA-Z0-9_\-]', '_', user_id)
-    if not safe or safe.startswith('.'):
-        safe = f"user_{safe}"
-    return safe[:64]  # cap length
+USER_ID_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_.@:+-]{0,127}$")
+_LEGACY_ID_RE = re.compile(r"^[A-Za-z0-9_-]{1,64}$")
+
+
+def valid_user_id(raw) -> str | None:
+    """The userId if it is a well-formed string, else None. Never sanitises: two
+    different ids must never be folded into one."""
+    return raw if isinstance(raw, str) and USER_ID_RE.match(raw) else None
+
+
+def repo_dir(user_id: str) -> Path:
+    """Repo directory for a validated userId: readable prefix + hash of the full id,
+    so ids that look alike ("a_b", "a-b", "a.b") can never share a directory."""
+    stem = re.sub(r"[^A-Za-z0-9_-]", "_", user_id)[:24]
+    return MEMORY_DIR / f"{stem}-{hashlib.sha256(user_id.encode()).hexdigest()[:24]}"
+
+
+def user_token(user_id: str) -> str:
+    return hmac.new(API_KEY_SECRET.encode(), user_id.encode(), hashlib.sha256).hexdigest()
+
+
+def token_ok(user_id: str, authorization: str) -> bool:
+    """Is this Authorization header allowed to act as user_id?"""
+    if SINGLE_TENANT and API_KEY:
+        expected = API_KEY
+    elif API_KEY_SECRET:
+        expected = user_token(user_id)
+    else:
+        return True  # auth off (loopback only; main() refuses anything else)
+    return hmac.compare_digest(authorization.encode(), f"Bearer {expected}".encode())
 
 
 def get_user_repo(user_id: str) -> Path:
     """Get or create a user's memory repo (atomic, race-safe: memory_hook.init_repo)."""
-    user_id = _safe_user_id(user_id)
-    repo = MEMORY_DIR / user_id
+    repo = repo_dir(user_id)
     if not repo.exists():
+        legacy = MEMORY_DIR / user_id  # pre-hash layout: adopt it once
+        if _LEGACY_ID_RE.match(user_id) and (legacy / ".git").is_dir():
+            try:
+                os.rename(legacy, repo)
+                log(f"[repo] migrated legacy repo for {user_id}")
+                return repo
+            except OSError:
+                pass  # lost a race with another request doing the same
         log(f"[repo] creating new repo for {user_id}")
         init_repo(str(repo), user_id)
     return repo
+
+
+def evict_user(user_id: str):
+    """Forget an idle user's in-memory state and timer. The memory itself is on disk."""
+    with _timer_lock:
+        timer = _inactivity_timers.pop(user_id, None)
+    if timer:
+        timer.cancel()
+    with _state_lock:
+        state = _user_state.pop(user_id, None)
+    if state and state.get("memory"):
+        state["memory"].close()
 
 
 def get_user_state(user_id: str) -> dict:
@@ -435,7 +506,7 @@ def stream_llm(messages: list[dict]):
 
 
 def reset_inactivity_timer(user_id: str):
-    """Reset the 10-min inactivity timer for a user."""
+    """(Re)start the idle timer; when it fires: consolidate what is pending, free the state."""
     with _timer_lock:
         old = _inactivity_timers.pop(user_id, None)
         if old:
@@ -446,10 +517,14 @@ def reset_inactivity_timer(user_id: str):
             # Same per-user chat lock as /v1/chat and /v1/bye, so an in-flight chat
             # delays this thread instead of racing it. Lock order: chat -> state.
             with _chat_lock(user_id):
+                with _timer_lock:
+                    if _inactivity_timers.get(user_id) is not timer:
+                        return  # the user came back while we waited for the lock
                 with _state_lock:
                     state = _user_state.get(user_id)
                 if state and state["pending"]:
                     consolidate_pending(user_id, get_user_repo(user_id), state)
+                evict_user(user_id)
 
         timer = threading.Timer(INACTIVITY_SECONDS, on_inactive)
         timer.daemon = True
@@ -538,20 +613,28 @@ def _github_api(endpoint: str, token: str, method: str = "GET", payload: dict | 
         return None
 
 
+REPO_NAME_RE = re.compile(r"^[A-Za-z0-9_.-]{1,100}$")
+
+
+def valid_repo_name(name) -> bool:
+    return (isinstance(name, str) and REPO_NAME_RE.match(name) is not None
+            and name not in (".", "..") and not name.endswith(".git"))
+
+
 def setup_github_remote(repo: Path, token: str, repo_name: str | None = None) -> dict:
     """
     Validate GitHub token, create private repo if needed, set as remote, initial push.
     Returns {"ok": True, "repo_url": ...} or {"ok": False, "error": ...}.
     """
+    repo_name = repo_name or "viral-git-agent-memory"
+    if not valid_repo_name(repo_name):
+        return {"ok": False, "error": "Invalid repoName (letters, digits, . _ - only)"}
+
     # 1. Validate token — get GitHub username
     user_info = _github_api("/user", token)
     if not user_info or "login" not in user_info:
         return {"ok": False, "error": "Invalid GitHub token — could not authenticate"}
-
     gh_username = user_info["login"]
-    repo_name = repo_name or "viral-git-agent-memory"
-    # Sanitize repo name
-    repo_name = re.sub(r'[^a-zA-Z0-9_\-.]', '-', repo_name)
 
     # 2. Create private repo (idempotent — 422 if exists)
     create_result = _github_api("/user/repos", token, method="POST", payload={
@@ -567,51 +650,24 @@ def setup_github_remote(repo: Path, token: str, repo_name: str | None = None) ->
     # No credentials in the URL — git_auth supplies them per command instead.
     remote_url = f"https://x-access-token@github.com/{gh_username}/{repo_name}.git"
 
+    # 3. Set the remote and push, under the repo lock: a consolidation commit or push
+    # running at the same moment would otherwise race us on .git/index.lock.
     try:
-        with git_auth(token) as env:
-            # Every git call is time-bounded: this whole handler runs inside the
-            # HTTP request thread, so a hung git (credential prompt, stuck
-            # network) used to wedge that thread — and the user's chat lock —
-            # forever. GIT_TERMINAL_PROMPT=0 comes from git_auth's env.
-            subprocess.run(
-                ["git", "remote", "remove", GITHUB_REMOTE], cwd=repo,
-                capture_output=True, timeout=GIT_CMD_TIMEOUT,
-            )
-            result = subprocess.run(
-                ["git", "remote", "add", GITHUB_REMOTE, remote_url],
-                cwd=repo, capture_output=True, text=True, timeout=GIT_CMD_TIMEOUT,
-            )
-            if result.returncode != 0:
-                return {"ok": False, "error": f"Failed to set git remote: {result.stderr.strip()[:100]}"}
-
-            # 4. Initial push. Ensure there's at least one commit first.
-            subprocess.run(
-                ["git", "add", "-A"], cwd=repo, capture_output=True, env=env,
-                timeout=GIT_CMD_TIMEOUT,
-            )
-            subprocess.run(
-                ["git", "commit", "-m", "init memory vault", "--allow-empty"],
-                cwd=repo, capture_output=True, text=True, env=env,
-                timeout=GIT_CMD_TIMEOUT,
-            )
-            branch = subprocess.run(
-                ["git", "branch", "--show-current"], cwd=repo,
-                capture_output=True, text=True, timeout=GIT_CMD_TIMEOUT,
-            )
-            branch_name = branch.stdout.strip() or "main"
-            # No -u: the upstream stays the memory store, so a later bare `git push`
-            # (memory_hook.git_commit does exactly that) still goes there and not here.
-            push = subprocess.run(
-                ["git", "push", GITHUB_REMOTE, branch_name],
-                cwd=repo, capture_output=True, text=True, env=env,
-                timeout=GIT_PUSH_TIMEOUT,
-            )
+        with repo_lock(repo):
+            have = run_git(repo, "remote").stdout.split()
+            run_git(repo, "remote", "set-url" if GITHUB_REMOTE in have else "add",
+                    GITHUB_REMOTE, remote_url, check=True)
+            if commit_all(repo, "init memory vault", allow_empty=True, log=log) == "failed":
+                return {"ok": False, "error": "Could not commit the memory repo — see server log"}
+            ok, err = push_github(repo, token)
+    except GitError as e:
+        return {"ok": False, "error": f"git failed during GitHub setup: {e}"}
     except subprocess.TimeoutExpired:
         return {"ok": False, "error": f"git timed out during GitHub setup (>{GIT_CMD_TIMEOUT}s) — try again"}
-    if push.returncode != 0:
-        return {"ok": False, "error": f"Repo created but push failed: {push.stderr.strip()[:200]}"}
+    if not ok:
+        return {"ok": False, "error": f"Repo created but push failed: {err}"}
 
-    # 5. Save credentials. The token is kept (0600, gitignored) because every later
+    # 4. Save credentials. The token is kept (0600, gitignored) because every later
     # consolidation has to authenticate a push without the user being there to retype
     # it. It stays out of .git/config, out of argv and out of every response.
     save_git_credentials(repo, {
@@ -632,6 +688,8 @@ def setup_github_remote(repo: Path, token: str, repo_name: str | None = None) ->
 # Request bodies are JSON control messages — anything bigger is an accident or
 # an attack. Uncapped rfile.read() let one POST exhaust server memory.
 MAX_BODY_BYTES = 10 * 1024 * 1024
+MAX_TRANSCRIPT_MESSAGES = 2000
+MAX_MESSAGE_CHARS = 100_000
 
 
 def _host_header_ok(host_header: str | None) -> bool:
@@ -646,7 +704,7 @@ def _host_header_ok(host_header: str | None) -> bool:
     keyless server only answers to loopback names (plus ALLOWED_HOSTS). With
     API_KEY set the Bearer secret already covers this.
     """
-    if API_KEY:
+    if auth_enabled():
         return True
     if not host_header:
         return True  # browsers always send Host; this is a bare HTTP/1.0 client
@@ -662,6 +720,8 @@ def _host_header_ok(host_header: str | None) -> bool:
 
 
 class ChatHandler(http.server.BaseHTTPRequestHandler):
+    timeout = SOCKET_TIMEOUT  # per socket operation: a stalled client cannot pin a thread
+
     def log_message(self, format, *args):
         # Suppress default request logging
         pass
@@ -671,6 +731,15 @@ class ChatHandler(http.server.BaseHTTPRequestHandler):
             return True
         self.send_error(403, "Host not allowed")
         return False
+
+    def _send_json(self, status: int, obj: dict):
+        body = json.dumps(obj).encode()
+        self.send_response(status)
+        self.send_header("Content-Type", "application/json")
+        self.send_header("Content-Length", str(len(body)))
+        self._cors_headers()
+        self.end_headers()
+        self.wfile.write(body)
 
     def _read_json_body(self) -> dict | None:
         """Read and parse a JSON request body with a hard size cap.
@@ -707,14 +776,22 @@ class ChatHandler(http.server.BaseHTTPRequestHandler):
             return None
         return data
 
-    def _check_auth(self) -> bool:
-        if not API_KEY:
-            return True
-        auth = self.headers.get("Authorization", "")
-        if hmac.compare_digest(auth.encode(), f"Bearer {API_KEY}".encode()):
-            return True
-        self.send_error(401, "Unauthorized")
-        return False
+    def _identify(self, raw) -> str | None:
+        """userId is required, strictly validated, and must match the caller's token.
+
+        Returns the id, or None after sending 400 (missing/invalid) or 401 (bad token).
+        """
+        if raw is None or raw == "":
+            self.send_error(400, "userId required")
+            return None
+        user_id = valid_user_id(raw)
+        if user_id is None:
+            self.send_error(400, "invalid userId (1-128 chars: letters, digits, . _ @ : + -)")
+            return None
+        if not token_ok(user_id, self.headers.get("Authorization", "")):
+            self.send_error(401, "Unauthorized")
+            return None
+        return user_id
 
     def _cors_headers(self):
         # No CORS headers at all unless the origin is allowed — a keyless
@@ -742,69 +819,61 @@ class ChatHandler(http.server.BaseHTTPRequestHandler):
     def do_GET(self):
         if not self._check_host():
             return
-        if self.path == "/health":
-            self.send_response(200)
-            self.send_header("Content-Type", "application/json")
-            self._cors_headers()
-            self.end_headers()
-            self.wfile.write(json.dumps({
-                "status": "ok",
-                "users": len(_user_state),
-                "memory_dir": str(MEMORY_DIR),
-            }).encode())
-            return
-        if self.path.startswith("/v1/git/status"):
+        path = urlparse(self.path).path  # exact match: no query, no prefix tricks
+        if path == "/health":
+            return self._send_json(200, {"status": "ok"})
+        if path == "/v1/git/status":
             return self._handle_git_status()
         self.send_error(404)
+
+    POST_ROUTES = {
+        "/v1/chat": "_handle_chat",
+        "/v1/bye": "_handle_bye",
+        "/v1/consolidate": "_handle_consolidate",
+        "/v1/git/setup": "_handle_git_setup",
+        "/v1/git/update": "_handle_git_setup",  # same logic — idempotent
+    }
 
     def do_POST(self):
         if not self._check_host():
             return
-        if self.path == "/v1/bye":
-            return self._handle_bye()
-        if self.path == "/v1/consolidate":
-            return self._handle_consolidate()
-        if self.path == "/v1/git/setup":
-            return self._handle_git_setup()
-        if self.path == "/v1/git/update":
-            return self._handle_git_setup()  # same logic — idempotent
-        if self.path != "/v1/chat":
+        route = self.POST_ROUTES.get(urlparse(self.path).path)
+        if route is None:
             self.send_error(404)
             return
+        getattr(self, route)()
 
-        if not self._check_auth():
-            return
-
+    def _handle_chat(self):
         data = self._read_json_body()
         if data is None:
             return
-
+        user_id = self._identify(data.get("userId"))
+        if user_id is None:
+            return
         raw_message = data.get("message", "")
         if not isinstance(raw_message, str):
             self.send_error(400, "message must be a string")
             return
         message = raw_message.strip()
-        # Sanitize at the boundary: this id keys state, timers AND the repo dir.
-        user_id = _safe_user_id(str(data.get("userId", "anonymous")))
-
         if not message:
             self.send_error(400, "Empty message")
+            return
+        if len(message) > MAX_MESSAGE_CHARS:
+            self.send_error(413, "message too long")
             return
 
         log(f"[chat] user={user_id} msg={message[:80]}...")
 
         # Serialize per user: ThreadingMixIn serves each request on its own
         # thread, so two fast messages from one user would otherwise interleave.
-        # The rest runs in _chat_locked, holding the user's lock end to end.
         with _chat_lock(user_id):
             self._chat_locked(user_id, message)
 
     def _chat_locked(self, user_id: str, message: str):
         """Body of /v1/chat, run under the per-user lock.
 
-        daemon.py's handlers got per-user locks in pass 1 for exactly this:
-        interleaved history appends and a double-fired consolidation when two
-        requests for one user race.
+        Without the lock, two requests for one user interleave history appends and
+        double-fire consolidation.
         """
         repo = get_user_repo(user_id)
         state = get_user_state(user_id)
@@ -814,7 +883,11 @@ class ChatHandler(http.server.BaseHTTPRequestHandler):
         # so history never holds an orphan user turn.
         turn = {"role": "user", "content": message}
         state["history"].append(turn)
-        messages = assemble_context(repo, state)
+        try:
+            messages = assemble_context(repo, state)
+        except Exception:
+            state["history"].remove(turn)
+            raise
 
         self.send_response(200)
         self.send_header("Content-Type", "text/event-stream")
@@ -862,163 +935,123 @@ class ChatHandler(http.server.BaseHTTPRequestHandler):
 
     def _handle_bye(self):
         """Handle /v1/bye — trigger consolidation and clean up."""
-        if not self._check_auth():
-            return
-
         data = self._read_json_body()
         if data is None:
             return
-
-        # Sanitize at the boundary: this id keys state, timers AND the repo dir.
-        user_id = _safe_user_id(str(data.get("userId", "anonymous")))
+        user_id = self._identify(data.get("userId"))
+        if user_id is None:
+            return
         log(f"[bye] user={user_id}")
 
-        # Cancel inactivity timer
-        with _timer_lock:
-            timer = _inactivity_timers.pop(user_id, None)
-            if timer:
-                timer.cancel()
-
-        # Trigger consolidation if there's history. Take the per-user chat
-        # lock so /bye can't clear history out from under a streaming /v1/chat.
+        # Take the per-user chat lock so /bye can't clear history out from under a
+        # streaming /v1/chat.
         did_consolidate = False
         with _chat_lock(user_id):
             with _state_lock:
                 state = _user_state.get(user_id)
             if state:
                 did_consolidate = bool(state["pending"])
-                # Clears history too, so reconnection starts fresh
                 consolidate_pending(user_id, get_user_repo(user_id), state, reset_history=True)
-
-        self.send_response(200)
-        self.send_header("Content-Type", "application/json")
-        self._cors_headers()
-        self.end_headers()
-        self.wfile.write(json.dumps({"status": "bye", "consolidated": did_consolidate}).encode())
-
+            evict_user(user_id)
+        self._send_json(200, {"status": "bye", "consolidated": did_consolidate})
 
     def _handle_consolidate(self):
         """Handle /v1/consolidate — receive transcript, run extraction, commit to git."""
-        if not self._check_auth():
-            return
-
         data = self._read_json_body()
         if data is None:
             return
-
-        # Sanitize at the boundary: this id keys state, timers AND the repo dir.
-        user_id = _safe_user_id(str(data.get("userId", "anonymous")))
-        transcript_msgs = data.get("transcript", [])
-        if not isinstance(transcript_msgs, list):
-            self.send_error(400, "transcript must be a list")
+        user_id = self._identify(data.get("userId"))
+        if user_id is None:
             return
-
-        if not transcript_msgs:
-            self.send_response(200)
-            self.send_header("Content-Type", "application/json")
-            self._cors_headers()
-            self.end_headers()
-            self.wfile.write(json.dumps({"status": "empty"}).encode())
+        transcript = data.get("transcript", [])
+        if not isinstance(transcript, list) or len(transcript) > MAX_TRANSCRIPT_MESSAGES:
+            self.send_error(400, f"transcript must be a list of at most {MAX_TRANSCRIPT_MESSAGES} messages")
             return
+        messages = []
+        for m in transcript:
+            content = m.get("content") if isinstance(m, dict) else None
+            ok_content = isinstance(content, str) or (
+                isinstance(content, list) and all(isinstance(b, dict) for b in content))
+            if not (isinstance(m, dict) and m.get("role") in ("user", "assistant") and ok_content
+                    and len(json.dumps(content)) <= MAX_MESSAGE_CHARS):
+                self.send_error(400, "each transcript item must be {role: user|assistant, content: string|blocks}")
+                return
+            messages.append({"role": m["role"], "content": content})
 
-        log(f"[consolidate] received {len(transcript_msgs)} messages for {user_id}")
+        if not messages:
+            return self._send_json(200, {"status": "empty"})
 
-        spawn_consolidation(user_id, get_user_repo(user_id), transcript_msgs)
-
-        self.send_response(200)
-        self.send_header("Content-Type", "application/json")
-        self._cors_headers()
-        self.end_headers()
-        self.wfile.write(json.dumps({
-            "status": "consolidating",
-            "user_id": user_id,
-            "messages": len(transcript_msgs),
-        }).encode())
-
+        log(f"[consolidate] received {len(messages)} messages for {user_id}")
+        spawn_consolidation(user_id, get_user_repo(user_id), messages)
+        self._send_json(200, {"status": "consolidating", "user_id": user_id, "messages": len(messages)})
 
     def _handle_git_setup(self):
         """Handle /v1/git/setup and /v1/git/update — connect user's memory to their GitHub."""
-        if not self._check_auth():
-            return
-
         data = self._read_json_body()
         if data is None:
             return
-
-        raw_user_id = str(data.get("userId", "")).strip()
-        github_token = str(data.get("githubToken", "")).strip()
+        user_id = self._identify(data.get("userId"))
+        if user_id is None:
+            return
+        github_token = data.get("githubToken")
         repo_name = data.get("repoName")  # optional
-        # A non-string (e.g. {"repoName": {}}) reached re.sub() after the GitHub
-        # calls and crashed the handler thread — the client got a dropped
-        # connection instead of an error. Reject it before any network call.
-        if repo_name is not None and not isinstance(repo_name, str):
-            self.send_error(400, "repoName must be a string")
-            return
-
-        if not raw_user_id:
-            self.send_error(400, "userId required")
-            return
-        user_id = _safe_user_id(raw_user_id)
-        if not github_token:
+        if not isinstance(github_token, str) or not github_token.strip():
             self.send_error(400, "githubToken required")
+            return
+        if repo_name is not None and not valid_repo_name(repo_name):
+            self.send_error(400, "repoName must be a string of letters, digits, . _ -")
             return
 
         log(f"[git/setup] user={user_id}")
-        repo = get_user_repo(user_id)
-        result = setup_github_remote(repo, github_token, repo_name)
-
-        status_code = 200 if result["ok"] else 400
-        self.send_response(status_code)
-        self.send_header("Content-Type", "application/json")
-        self._cors_headers()
-        self.end_headers()
-        self.wfile.write(json.dumps(result).encode())
+        result = setup_github_remote(get_user_repo(user_id), github_token.strip(), repo_name)
+        self._send_json(200 if result["ok"] else 400, result)
 
     def _handle_git_status(self):
         """Handle GET /v1/git/status?userId=xxx — check if GitHub is connected."""
-        if not self._check_auth():
+        raw = parse_qs(urlparse(self.path).query).get("userId", [""])[0].strip()
+        user_id = self._identify(raw)
+        if user_id is None:
             return
 
-        # Parse userId from query string
-        parsed = urlparse(self.path)
-        params = parse_qs(parsed.query)
-        raw_user_id = params.get("userId", [""])[0].strip()
-
-        if not raw_user_id:
-            self.send_error(400, "userId query param required")
-            return
-
-        user_id = _safe_user_id(raw_user_id)
-        repo = MEMORY_DIR / user_id
-
+        repo = repo_dir(user_id)
         response = {"userId": user_id, "connected": False}
-
         if repo.exists():
             creds = load_git_credentials(repo)
             if creds:
                 response["connected"] = True
-                response["github_username"] = creds.get("github_username", "")
-                response["repo_name"] = creds.get("repo_name", "")
-                response["repo_url"] = creds.get("repo_url", "")
-                response["configured_at"] = creds.get("configured_at", "")
-
-                # Check last push time from git log (any remote branch)
-                result = subprocess.run(
-                    ["git", "log", "--remotes", "-1", "--format=%ci"],
-                    cwd=repo, capture_output=True, text=True,
-                )
-                if result.returncode == 0 and result.stdout.strip():
-                    response["last_push"] = result.stdout.strip()
-
-        self.send_response(200)
-        self.send_header("Content-Type", "application/json")
-        self._cors_headers()
-        self.end_headers()
-        self.wfile.write(json.dumps(response).encode())
+                for key in ("github_username", "repo_name", "repo_url", "configured_at"):
+                    response[key] = creds.get(key, "")
+                try:  # last push time from git log (any remote branch)
+                    result = run_git(repo, "log", "--remotes", "-1", "--format=%ci", timeout=10)
+                    if result.returncode == 0 and result.stdout.strip():
+                        response["last_push"] = result.stdout.strip()
+                except subprocess.TimeoutExpired:
+                    pass
+        self._send_json(200, response)
 
 
 class ThreadedHTTPServer(ThreadingMixIn, http.server.HTTPServer):
+    """One thread per connection, but at most MAX_CONNECTIONS at once: past that, new
+    connections are dropped instead of piling up threads (slowloris)."""
+
     daemon_threads = True
+    request_queue_size = 64
+
+    def __init__(self, *args, **kwargs):
+        super().__init__(*args, **kwargs)
+        self._slots = threading.BoundedSemaphore(MAX_CONNECTIONS)
+
+    def process_request(self, request, client_address):
+        if not self._slots.acquire(blocking=False):
+            self.shutdown_request(request)
+            return
+        super().process_request(request, client_address)
+
+    def process_request_thread(self, request, client_address):
+        try:
+            super().process_request_thread(request, client_address)
+        finally:
+            self._slots.release()
 
 
 def _is_loopback(host: str) -> bool:
@@ -1037,6 +1070,15 @@ def main():
         if idx + 1 < len(sys.argv):
             port = int(sys.argv[idx + 1])
 
+    if "--issue-token" in sys.argv:  # python api_server.py --issue-token alice
+        idx = sys.argv.index("--issue-token")
+        uid = valid_user_id(sys.argv[idx + 1]) if idx + 1 < len(sys.argv) else None
+        if not API_KEY_SECRET or not uid:
+            print("usage: API_KEY_SECRET=... python api_server.py --issue-token USER_ID", file=sys.stderr)
+            sys.exit(1)
+        print(user_token(uid))
+        return
+
     if not LLM_PROVIDER or LLM_PROVIDER not in ("openai", "anthropic", "ollama"):
         print("ERROR: MEMORY_LLM_PROVIDER must be 'openai', 'anthropic', or 'ollama'", file=sys.stderr)
         sys.exit(1)
@@ -1050,11 +1092,22 @@ def main():
     model_name = {"openai": OPENAI_MODEL, "anthropic": ANTHROPIC_MODEL, "ollama": OLLAMA_MODEL}[LLM_PROVIDER]
     llm_url = {"openai": OPENAI_API_URL, "anthropic": ANTHROPIC_API_URL, "ollama": OLLAMA_URL}[LLM_PROVIDER]
 
-    if not API_KEY and not _is_loopback(HOST):
+    if API_KEY and not SINGLE_TENANT and not API_KEY_SECRET:
         print(
-            f"ERROR: refusing to bind {HOST} without API_KEY — every endpoint (chat,\n"
+            "ERROR: API_KEY is a single shared key: any holder could read or overwrite any\n"
+            "user's memory by naming their userId. Either set API_KEY_SECRET (per-user\n"
+            "tokens, see --issue-token) or, for a one-tenant deployment, SINGLE_TENANT=1.",
+            file=sys.stderr,
+        )
+        sys.exit(1)
+    if SINGLE_TENANT and not API_KEY:
+        print("ERROR: SINGLE_TENANT=1 needs API_KEY.", file=sys.stderr)
+        sys.exit(1)
+    if not auth_enabled() and not _is_loopback(HOST):
+        print(
+            f"ERROR: refusing to bind {HOST} without auth — every endpoint (chat,\n"
             "consolidation, GitHub token setup) would be open to anyone who can reach\n"
-            "this port. Set API_KEY, or use HOST=127.0.0.1.",
+            "this port. Set API_KEY_SECRET (or SINGLE_TENANT=1 with API_KEY), or use HOST=127.0.0.1.",
             file=sys.stderr,
         )
         sys.exit(1)
@@ -1062,29 +1115,29 @@ def main():
     # CORS on a keyless server is a contradiction: with no Bearer secret to
     # check, an allowed origin (or "*" ) lets any web page you visit — or a DNS
     # rebinding — read and drive the API from your browser. Refuse the combo;
-    # explicitly setting CORS_ORIGINS without API_KEY is never what you want.
-    if CORS_ORIGINS and not API_KEY:
+    # explicitly setting CORS_ORIGINS without auth is never what you want.
+    if CORS_ORIGINS and not auth_enabled():
         print(
-            "ERROR: CORS_ORIGINS is set but API_KEY is not — that lets arbitrary\n"
+            "ERROR: CORS_ORIGINS is set but auth is not — that lets arbitrary\n"
             "web pages drive this server (including via DNS rebinding to loopback).\n"
-            "Set API_KEY, or unset CORS_ORIGINS.",
+            "Enable auth, or unset CORS_ORIGINS.",
             file=sys.stderr,
         )
         sys.exit(1)
 
     MEMORY_DIR.mkdir(parents=True, exist_ok=True)
-    log(f"viral-git-agent-memory API server")
+    log("viral-git-agent-memory API server")
     log(f"  port:       {port}")
     log(f"  memory_dir: {MEMORY_DIR}")
     log(f"  provider:   {LLM_PROVIDER}")
     log(f"  model:      {model_name}")
     log(f"  llm_url:    {llm_url}")
     log(f"  host:       {HOST}")
-    log(f"  auth:       {'enabled' if API_KEY else 'disabled'}")
+    log(f"  auth:       {('single shared key' if SINGLE_TENANT else 'per-user tokens') if auth_enabled() else 'disabled'}")
     log(f"  cors:       {', '.join(sorted(CORS_ORIGINS)) or 'none'}")
-    log(f"  template:   {TEMPLATE_DIR}")
+    log(f"  embeddings: {os.environ.get('EMBED_URL') or 'off (full-text only)'}")
     log(f"  consolidate every {CONSOLIDATE_EVERY} messages")
-    log(f"")
+    log("")
 
     server = ThreadedHTTPServer((HOST, port), ChatHandler)
     try:

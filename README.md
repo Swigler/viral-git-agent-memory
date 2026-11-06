@@ -58,20 +58,18 @@ Inspired by [Mem0](https://github.com/mem0ai/mem0). For each extracted fact, com
 
 ```
 viral-git-agent-memory/
-├── api_server.py      # HTTP server: /v1/chat (SSE), /v1/bye, /v1/git/setup, /health
-├── memory_hook.py     # Consolidation engine: extraction, A.U.D.N., index blocks, git commit
-├── gitops.py          # Shared: repo lock, atomic writes, git, GitHub credentials, repo init
-├── template/          # Blank user repo skeleton
-│   ├── SOUL.md        # Base persona (nanobot-compatible naming)
-│   ├── USER.md        # User profile
-│   ├── USER_memory/
-│   ├── SOUL_memory/
-│   └── .gitignore
-├── gitmem.py          # Markdown format + every file writer + SQLite FTS5 index (search, ranking)
-├── bench.py           # 28k-memory scale check
-├── stress_test.py     # Load testing
-└── test_100msg.py     # 100-message conversation test
+├── api_server.py      # HTTP server: /v1/chat (SSE), /v1/bye, /v1/consolidate, /v1/git/*, /health
+├── memory_hook.py     # Consolidation worker: extraction, A.U.D.N., index blocks, git commit
+├── gitmem.py          # Markdown format + every file writer + derived index (FTS5, embeddings)
+├── gitops.py          # Repo lock, atomic writes, git (timeouts), GitHub credentials, repo init
+├── template/          # Blank user repo skeleton (SOUL.md, USER.md, .gitignore, memory dirs)
+├── stress_test.py     # File-layer tests (offline)
+├── test_github_auth.py / test_embeddings.py / test_server.py   # offline tests, see Tests
+├── test_100msg.py     # 100-message simulation (needs a live LLM)
+└── bench.py           # 28k-memory scale check
 ```
+
+Data flow: `api_server` assembles the prompt from `SOUL.md` + `USER.md` + memories read through `gitmem.Memory` (relevance-ranked for the current message). Every 30 messages, on `/v1/bye`, or after 10 idle minutes it hands the unconsolidated turns to `memory_hook.py` (a subprocess, serialised per user by the repo lock), which writes markdown through `gitmem`, regenerates the `## Index` blocks and commits/pushes through `gitops`.
 
 Each user gets their own repo:
 ```
@@ -94,42 +92,22 @@ This project is **built and code-reviewed but not yet production-tested or perso
 
 ### Tests
 
+All offline (stub HTTP servers stand in for the LLM and the embedding model); 187 assertions in total:
+
 ```bash
-# Offline test suite for the file layer — 63 assertions, no API key needed
-python stress_test.py
+python3 stress_test.py       # 63 assertions: file layer, ranking, parsing, git commit
+python3 gitmem.py            # selftest: index, search, capture, derived files, git
+python3 test_github_auth.py  # 5 checks: token handling, 0600 credentials, mirror push
+python3 test_embeddings.py   # 25 assertions: incremental re-embed, rebuild, hybrid ranking, fallback
+python3 test_server.py       # 94 assertions: userId/auth, LLM failure, history, races, routes
 
-# gitmem selftest (index, search, capture, git)
-python gitmem.py
-
-# Embeddings against a stub HTTP embedding server
-python test_embeddings.py
-
-# GitHub credential + mirror-push checks (no network, local bare repos stand in)
-python test_github_auth.py
-
-# Full test with live LLM (runs extraction + AUDN on a fake conversation)
-MEMORY_LLM_PROVIDER=ollama python stress_test.py
-
-# Smoke test — creates a repo, runs one consolidation, inspect the output
-MEMORY_LLM_PROVIDER=openai OPENAI_API_KEY=sk-xxx \
-python memory_hook.py --test /tmp/test_repo
+# Live LLM (extraction + A.U.D.N. on a fake conversation)
+MEMORY_LLM_PROVIDER=ollama python3 stress_test.py
+MEMORY_LLM_PROVIDER=ollama python3 test_100msg.py
+MEMORY_LLM_PROVIDER=openai OPENAI_API_KEY=sk-xxx python3 memory_hook.py --test /tmp/test_repo
 ```
 
-Example test output (offline, no LLM):
-```
-  ✅ USER_memory/ exists
-  ✅ file created
-  ✅ slug collision creates suffixed file
-  ✅ batch file 2 created (dedup)
-  ✅ fact updated
-  ✅ contradicted marker added
-  ✅ DELETE on missing slug doesn't crash
-  ✅ used-count ignores fact/episode text
-  ✅ common-fact ranked highest (5 uses)
-  ✅ new commit created
-  ✅ memory survives re-init
-  RESULTS: 63 passed, 0 failed
-```
+What is *not* covered: the real GitHub API (`/v1/git/setup` end to end), real LLM providers, real embedding models, and load/long-running behaviour (timers firing after 10 minutes).
 
 ## Quick Start
 
@@ -163,6 +141,15 @@ curl -N -X POST http://localhost:3100/v1/chat \
   -H "Content-Type: application/json" \
   -d '{"userId": "alice", "message": "Hi, I work as a designer and I love cats"}'
 ```
+
+`userId` is required. On a loopback-only server with no auth configured that is all you need; anywhere else you need a token (next section).
+
+### Auth model
+
+- **Per-user tokens (default when exposed).** Set `API_KEY_SECRET`. A caller must send `Authorization: Bearer <token>` where `token = HMAC-SHA256(API_KEY_SECRET, userId)` (hex). A token only works for its own `userId`, on every endpoint except `/health`. Mint one: `API_KEY_SECRET=... python3 api_server.py --issue-token alice`. Your backend holds the secret and gives each end user only their own token.
+- **Single tenant.** `SINGLE_TENANT=1` plus `API_KEY=...`: one shared Bearer key for every `userId`. Only for a deployment with one trusted client. `API_KEY` alone is refused at startup (it would let any key holder read or overwrite any user's memory).
+- **No auth.** Only allowed on a loopback `HOST`; a keyless server also rejects requests whose `Host` header is not a loopback name (DNS-rebinding guard).
+- **userId** — 1-128 characters of letters, digits and `. _ @ : + -` (first character alphanumeric); anything else is a 400, never rewritten. Each id gets its own repo directory named `<readable prefix>-<sha256 prefix>`, so `a_b`, `a-b` and `a.b` can never share memory. Repos from the old layout (`~/memory/<id>`) are adopted on first use.
 
 Response streams as SSE (Server-Sent Events) in OpenAI format.
 
@@ -205,7 +192,7 @@ Connect a user's memory to their GitHub account.
 {"userId": "alice", "githubToken": "ghp_xxx", "repoName": "my-memory"}
 ```
 
-`repoName` is optional — defaults to `viral-git-agent-memory`, so the repo appears as `github.com/username/viral-git-agent-memory`. Creates a **private** repo. Token is stored locally in `.git_credentials.json`, never committed or pushed.
+`repoName` is optional (letters, digits, `. _ -`; anything else is a 400) — defaults to `viral-git-agent-memory`. Creates a **private** repo. Token is stored locally in `.git_credentials.json`, never committed or pushed.
 
 ### `POST /v1/git/update`
 Change GitHub connection (same as setup, idempotent).
@@ -224,8 +211,12 @@ Manual consolidation with a transcript.
 {"userId": "alice", "transcript": [{"role": "user", "content": "..."}, {"role": "assistant", "content": "..."}]}
 ```
 
+Items must be `{role: "user"|"assistant", content: string | [blocks]}` (max 2000). If the LLM call fails the worker exits non-zero and keeps the transcript file (`<repo>/.transcript_*.jsonl`, gitignored); retry with `python3 memory_hook.py --consolidate REPO USER_ID TRANSCRIPT`.
+
 ### `GET /health`
-Server health check.
+Unauthenticated liveness probe: `{"status": "ok"}` and nothing else.
+
+All user-scoped endpoints return 400 for a missing/invalid `userId` and 401 for a missing/wrong token. Routes match exactly (a query string is fine, `/v1/chatX` is a 404).
 
 ## Environment Variables
 
@@ -241,11 +232,17 @@ Server health check.
 | `OLLAMA_URL` | No | `http://localhost:11434` | Ollama base URL |
 | `OLLAMA_MODEL` | No | `qwen3.5:4b` | Model name |
 | `MEMORY_DIR` | No | `~/memory` | Where user repos live |
-| `API_KEY` | If `HOST` is not loopback | — | Bearer token for client auth. The server refuses to bind a non-loopback address without it. |
-| `HOST` | No | `127.0.0.1` | Bind address. Set `0.0.0.0` (plus `API_KEY`) for remote clients. |
-| `CORS_ORIGINS` | No | `*` if `API_KEY` set, else none | Comma-separated browser origins allowed to call the API, or `*`. Requires `API_KEY` — the server refuses to start with `CORS_ORIGINS` and no key. |
-| `ALLOWED_HOSTS` | No | — | Keyless servers only answer requests whose `Host` header is a loopback name (DNS-rebinding guard). List extra hostnames here, e.g. a reverse proxy's. Ignored when `API_KEY` is set. |
+| `API_KEY_SECRET` | If `HOST` is not loopback (or `SINGLE_TENANT`) | — | Per-user tokens: `HMAC-SHA256(secret, userId)`. See Auth model. |
+| `SINGLE_TENANT` | No | off | `1` = one shared `API_KEY` for every user. |
+| `API_KEY` | With `SINGLE_TENANT=1` | — | The shared key. Refused alone. |
+| `HOST` | No | `127.0.0.1` | Bind address. A non-loopback address without auth is refused at startup. |
+| `CORS_ORIGINS` | No | `*` if auth on, else none | Comma-separated browser origins allowed to call the API, or `*`. Refused without auth. |
+| `ALLOWED_HOSTS` | No | — | Keyless servers only answer requests whose `Host` header is a loopback name. List extra hostnames here. Ignored when auth is on. |
 | `PORT` | No | `3100` | Server port |
+| `SOCKET_TIMEOUT` | No | `60` | Seconds per client socket operation (slowloris guard) |
+| `MAX_CONNECTIONS` | No | `64` | Concurrent connections; more are dropped |
+| `GIT_CMD_TIMEOUT` / `GIT_PUSH_TIMEOUT` | No | `60` / `120` | Seconds before a git command / push is killed |
+| `EMBED_URL`, `EMBED_MODEL`, `EMBED_API_KEY`, `EMBED_TIMEOUT`, `EMBED_MIN_SIM` | No | off | Optional embeddings, see Search |
 
 All `POST` bodies must be sent with `Content-Type: application/json` (max 10 MB).
 
@@ -338,26 +335,26 @@ python bench.py     # 28k scale check
 
 ## Concurrency & Reliability
 
-- **One per-repo lock** — `.gitmem.lock` (`fcntl.flock`, POSIX only, re-entrant within a thread) is taken by every writer: consolidation, `gitmem.Memory`, the GitHub setup. All file writes are atomic (temp file + `os.replace`).
-- **Slug collision handling** — if an ADD generates a slug that already exists on disk (or duplicates within the same batch), it auto-suffixes (`likes-coffee-2`, `likes-coffee-3`)
-- **Missing target warnings** — UPDATE/DELETE on a slug that doesn't exist on disk logs a `[warn]` instead of silently no-oping
-- **Git error detection** — distinguishes "nothing to commit" from real failures (disk full, identity misconfigured, index locked)
-- **Contradiction tracking** — the DELETE action marks memories as contradicted (excluded from recall and search, never destroyed, so `git revert` always works)
+- **One per-repo lock** — `.gitmem.lock` (`fcntl.flock`, POSIX only, re-entrant within a thread) is taken by every writer: consolidation, `gitmem.Memory`, GitHub setup. All file writes are atomic (temp file + `os.replace`).
+- **Consolidation never loses a conversation** — LLM errors raise; the worker exits non-zero and keeps the transcript. Nothing is written until both extractions succeed. Each trigger (every 30 messages, `/bye`, idle timer) snapshots and clears one unconsolidated buffer, so no turn is skipped or consolidated twice (the chat window sent to the model is a separate, bounded view).
+- **Failed chats leave no trace** — an LLM error drops the user turn; history never starts with an assistant turn.
+- **Atomic repo creation** — built in a temp dir and renamed, so concurrent first requests and failed inits never leave a half-built repo.
+- **Bounded** — every git call has a timeout; worker processes are reaped; a connection cap and socket timeout bound threads; idle user state and timers are evicted after 10 minutes (memory stays on disk; only the chat window is forgotten).
+- **A.U.D.N. sees the right memories** — all of them for a small store, else the ones relevant to the new facts (full-text/embeddings) plus the popular ones; Fact text only.
+- **Slug collision handling** — auto-suffixes (`likes-coffee-2`).
+- **Contradiction tracking** — DELETE marks a memory contradicted: excluded from recall and search, never destroyed, so `git revert` always works.
+- **Generated indexes** — each consolidation regenerates the `## Index` block in `SOUL.md`/`USER.md` (stripped from the prompt, there for people reading the repo on GitHub).
 
 ## Security
 
-- **Path traversal prevention** on user IDs and LLM-generated slugs
-- **Token never written into git** — the GitHub token is passed per-command through a
-  throwaway `GIT_ASKPASS` helper, so it is in neither the remote URL (which would land
-  in `.git/config` in plaintext and come back out in git's own error messages) nor
-  `argv` (visible in `ps`)
-- **Token handling** — the token is never in argv, the remote URL or `.git/config`; git's stderr (which cannot contain it) is truncated before it is logged or returned
-- **Credentials gitignored and 0600** — `.git_credentials.json` is created private and
-  is never committed or pushed
-- **The mirror is a separate remote** — the user's GitHub is `github`, never `origin`,
-  so connecting it cannot repoint the operator's memory store
-- **Optional API key** — Bearer token auth for the server
-- **Private repos** — GitHub repos are created as private by default
+- **Per-user auth** — see Auth model. userId is required and strictly validated; repo directories are hash-derived.
+- **Path traversal** — LLM slugs and `memory_type` are validated everywhere that builds a path.
+- **Memory-file injection** — lines starting with `## ` in facts/episodes are neutralised, so a fact cannot pin itself or forge access-log entries.
+- **Token never written into git** — the GitHub token is passed per command through a throwaway `GIT_ASKPASS` helper (0700, in `XDG_RUNTIME_DIR` or the repo's `.git`, not `/tmp`), so it is in neither the remote URL nor `argv`.
+- **Credentials gitignored and 0600** — `.git_credentials.json` is never committed or pushed.
+- **Separate mirror remote** — the user's GitHub is `github`, never `origin`; connecting it cannot repoint the operator's memory store. The setup response echoes at most 200 characters of git's stderr.
+- **Private repos** by default; request bodies capped at 10 MB; `Content-Type: application/json` required (forces a CORS preflight).
+- Not covered: TLS (put a reverse proxy in front), rate limiting, token revocation (rotate `API_KEY_SECRET`).
 
 ## Agent-Agnostic
 

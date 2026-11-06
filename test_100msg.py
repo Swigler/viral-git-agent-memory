@@ -9,6 +9,7 @@ Facts evolve and contradict across rounds to stress-test AUDN.
 """
 import os
 import sys
+import tempfile
 import time
 from pathlib import Path
 
@@ -16,7 +17,7 @@ from pathlib import Path
 sys.path.insert(0, str(Path(__file__).parent))
 from memory_hook import init_repo, consolidate
 
-REPO = "/tmp/test_100msg"
+REPO = os.path.join(tempfile.mkdtemp(prefix="test_100msg_"), "repo")
 
 # --- 100 messages split into 4 rounds of ~25 exchanges ---
 
@@ -146,13 +147,8 @@ def run_test():
         shutil.rmtree(REPO)
 
     init_repo(REPO, "marcus_42")
-    # Init git
     import subprocess
-    env = {**os.environ, "GIT_AUTHOR_NAME": "test", "GIT_AUTHOR_EMAIL": "test@test",
-           "GIT_COMMITTER_NAME": "test", "GIT_COMMITTER_EMAIL": "test@test"}
-    subprocess.run(["git", "init"], cwd=REPO, capture_output=True, env=env)
-    subprocess.run(["git", "add", "-A"], cwd=REPO, capture_output=True, env=env)
-    subprocess.run(["git", "commit", "-m", "init"], cwd=REPO, capture_output=True, env=env)
+    env = os.environ
 
     rounds = [
         ("Round 1 (msg 1-30): Initial facts", ROUND_1),
@@ -189,14 +185,17 @@ def run_test():
     for line in result.stdout.strip().split("\n"):
         print(f"    {line}")
 
-    # Show final indexes
-    for mem_type in ["USER_memory", "SOUL_memory"]:
-        idx = Path(REPO) / f"{mem_type}.md"
-        if idx.exists():
-            print(f"\n{'='*60}")
-            print(f"  {idx.name}")
-            print(f"{'='*60}")
-            print(idx.read_text())
+    # What a live run must have produced (needs MEMORY_LLM_PROVIDER + credentials)
+    user_files = list((Path(REPO) / "USER_memory").glob("*.md"))
+    assert user_files, "no USER memories were extracted"
+    assert result.stdout.count("checkpoint") >= len(rounds), result.stdout
+    assert "gitmem:index:begin" in (Path(REPO) / "USER.md").read_text(), "index block not regenerated"
+    from gitmem import Memory
+    mem = Memory(REPO, embedder=None)
+    live = {h["slug"] for h in mem.top("USER", 100)}
+    contradicted = {f.stem for f in user_files if "## Contradicted" in f.read_text()}
+    assert not live & contradicted, f"contradicted memories still ranked: {live & contradicted}"
+    mem.close()
 
     print(f"\n✅ Done — repo at {REPO}")
 
