@@ -101,6 +101,9 @@ python stress_test.py
 # gitmem selftest (index, search, capture, git)
 python gitmem.py
 
+# Embeddings against a stub HTTP embedding server
+python test_embeddings.py
+
 # GitHub credential + mirror-push checks (no network, local bare repos stand in)
 python test_github_auth.py
 
@@ -268,7 +271,7 @@ The consolidation hook never deletes a memory file: a contradicted memory gets a
 
 Ranking by pinned → use-count → recency means the agent recalls what is **popular**, never what is **relevant**. `gitmem.py` adds full-text search over the same files, so it can answer "what do I know about X".
 
-**The markdown stays the truth. The index is derived** — SQLite FTS5, gitignored, rebuilt from the files in under six seconds. Delete it and you lose nothing. There is deliberately no vector store: a HNSW index under this exact write pattern (small incremental adds, one memory at a time) inflated from 233 KB to 399 GB in twenty minutes. That failure class is structurally absent here.
+**The markdown stays the truth. The index is derived** — SQLite FTS5, gitignored, rebuilt from the files in under six seconds. Delete it and you lose nothing. There is deliberately no vector *store*: a HNSW index under this exact write pattern (small incremental adds, one memory at a time) inflated from 233 KB to 399 GB in twenty minutes. Embeddings, when enabled, are plain rows in the same throwaway SQLite file, so that failure class is structurally absent here.
 
 Still zero dependencies — `sqlite3` is stdlib.
 
@@ -305,9 +308,28 @@ mem.commit()                                # regenerate index blocks + one git 
 | write throughput | ~400/s |
 | total repo on disk | 42.7 MB |
 
-### The honest limit
+### Optional embeddings (a derived index, like the FTS table)
 
-Keyword search cannot cross a vocabulary gap. Ask about a memory in words it does not contain and you get **nothing back** — asserted in the selftest, not hidden. An earlier version returned the *wrong* memory at a confident 0.7 score, because stopwords matched every document. A miss beats a confident wrong answer. Closing that gap needs embeddings, and that is the point to add them.
+Keyword search cannot cross a vocabulary gap: ask about "caffeine" and a memory that says "espresso" is not found (asserted in the selftest, not hidden — a miss beats a confident wrong answer). Embeddings close that gap, and they stay **derived**: git is the source of truth, the vectors are float32 BLOBs in the same gitignored `index.sqlite3` (table `embeddings`: `memory_type, slug, content_hash, dim, vector`).
+
+- **Incremental.** Sync re-embeds only memories whose `## Fact` text hash (plus the model name) changed. Delete `index.sqlite3` and everything is rebuilt from the markdown.
+- **Provider.** Any OpenAI-compatible `POST {EMBED_URL}/v1/embeddings` (`{model, input: [...]}`), batched, over `urllib`. Off unless `EMBED_URL` is set.
+- **Search.** The query is embedded, scored by brute-force cosine in pure Python (no numpy), and fused with the FTS5 ranking by reciprocal rank fusion (`1/(60+rank)`); then pinned and well-used memories get a small boost. Neighbours below half of the best similarity are dropped. Contradicted memories are excluded everywhere; at most `n/2` pinned memories lead a recall.
+- **Never breaks chat.** If `EMBED_URL` is unset, or a call fails, search is FTS-only (logged once; the endpoint is left alone for 30 s).
+- **Scale.** Brute force is fine to roughly 10k memories per user.
+
+| Env | Default | |
+|---|---|---|
+| `EMBED_URL` | unset (off) | Base URL, e.g. `http://127.0.0.1:8081` |
+| `EMBED_MODEL` | `default` | Model name sent in the request |
+| `EMBED_API_KEY` | — | Sent as `Authorization: Bearer` if set |
+| `EMBED_TIMEOUT` | `10` | Seconds per request |
+| `EMBED_MIN_SIM` | `0` | Optional absolute cosine floor |
+
+Recommended models:
+
+- **CPU:** `bge-small-en-v1.5` or `nomic-embed-text`, served by `llama-server --embedding -m bge-small-en-v1.5-q8_0.gguf --port 8081 --pooling mean` (then `EMBED_URL=http://127.0.0.1:8081`).
+- **GPU:** `Qwen3-Embedding-0.6B` behind any OpenAI-compatible server (llama-server `--embedding --pooling last`, vLLM, ...).
 
 ```bash
 python gitmem.py    # selftest

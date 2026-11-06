@@ -1,10 +1,12 @@
-"""Git-backed agent memory with real search. Markdown is the truth, SQLite FTS5 is the index.
+"""Git-backed agent memory with real search. Markdown is the truth; the index is derived.
 
 MemPalace's retrieval guts on viral-git-agent-memory's storage model, with the
 vector database removed. Chroma's HNSW index inflated `link_lists.bin` from
 233 KB to 399 GB in twenty minutes doing nothing but small incremental adds, so
-there is deliberately no vector store here — and nothing to corrupt, because the
-index is derived and can be thrown away at any time.
+there is deliberately no vector store: search is SQLite FTS5, plus (optional)
+embeddings kept as plain float32 BLOBs in the same derived SQLite file and scanned
+brute-force. Nothing to corrupt, because the whole index can be thrown away at any
+time and is rebuilt from the markdown.
 
 Layout of a memory repo (viral-git's, unchanged):
 
@@ -22,12 +24,21 @@ POSIX only (fcntl lock via gitops). Zero dependencies — sqlite3 is stdlib, git
 already required by the repo model.
 """
 
+import array
 import functools
+import hashlib
+import heapq
+import json
+import math
+import operator
+import os
 import re
 import sqlite3
 import subprocess
 import threading
+import time
 import unicodedata
+import urllib.request
 from datetime import date
 from pathlib import Path
 
@@ -42,7 +53,8 @@ INDEX_FILE = "index.sqlite3"
 INDEX_BEGIN = "<!-- gitmem:index:begin -->"
 INDEX_END = "<!-- gitmem:index:end -->"
 DEFAULT_N = 10  # memories per recall; the server and the hook share this one number
-SCHEMA_VERSION = 2
+SCHEMA_VERSION = 3
+RRF_K = 60  # reciprocal rank fusion constant
 
 # Derived files that must never enter git: the index is rebuilt from the markdown in
 # seconds, but it is ~2x the size of the markdown and rewritten whole on every commit,
@@ -64,6 +76,14 @@ CREATE TABLE IF NOT EXISTS memories (
     mtime        REAL NOT NULL,
     sig          TEXT NOT NULL DEFAULT '',
     UNIQUE(memory_type, slug)
+);
+CREATE TABLE IF NOT EXISTS embeddings (
+    memory_type  TEXT NOT NULL,
+    slug         TEXT NOT NULL,
+    content_hash TEXT NOT NULL,
+    dim          INTEGER NOT NULL,
+    vector       BLOB NOT NULL,
+    PRIMARY KEY (memory_type, slug)
 );
 CREATE VIRTUAL TABLE IF NOT EXISTS memories_fts USING fts5(
     text, content='memories', content_rowid='rowid', tokenize='porter unicode61'
@@ -315,6 +335,69 @@ def match_expr(query: str) -> str:
     return " OR ".join(f'"{w}"' for w in words)
 
 
+# ── embeddings (optional, derived) ────────────────────────────────────────────
+
+
+class EmbedError(RuntimeError):
+    pass
+
+
+class Embedder:
+    """OpenAI-compatible embeddings over HTTP: POST {url}/v1/embeddings {model, input}.
+
+    Works with llama-server --embedding, vLLM, Ollama's /v1 endpoint, OpenAI, ...
+    """
+
+    def __init__(self, url: str, model: str, api_key: str = "", timeout: float = 10.0,
+                 batch: int = 32):
+        self.url, self.model = url.rstrip("/"), model
+        self.api_key, self.timeout, self.batch = api_key, timeout, batch
+
+    def embed(self, texts: list[str]) -> list[list[float]]:
+        out: list[list[float]] = []
+        for i in range(0, len(texts), self.batch):
+            out += self._call(texts[i:i + self.batch])
+        return out
+
+    def _call(self, texts: list[str]) -> list[list[float]]:
+        req = urllib.request.Request(
+            f"{self.url}/v1/embeddings",
+            data=json.dumps({"model": self.model, "input": texts}).encode(),
+            headers={"Content-Type": "application/json",
+                     **({"Authorization": f"Bearer {self.api_key}"} if self.api_key else {})},
+            method="POST",
+        )
+        try:
+            with urllib.request.urlopen(req, timeout=self.timeout) as resp:
+                data = sorted(json.loads(resp.read())["data"], key=lambda d: d["index"])
+            vectors = [[float(x) for x in d["embedding"]] for d in data]
+        except Exception as e:  # noqa: BLE001 — any failure means "no embeddings this time"
+            raise EmbedError(f"{self.url}: {e}") from e
+        if len(vectors) != len(texts) or len({len(v) for v in vectors}) > 1:
+            raise EmbedError(f"{self.url}: got {len(vectors)} vectors for {len(texts)} inputs")
+        return vectors
+
+
+def embedder_from_env() -> "Embedder | None":
+    """EMBED_URL, EMBED_MODEL, EMBED_API_KEY (optional), EMBED_TIMEOUT. Unset URL = off."""
+    url = os.environ.get("EMBED_URL", "").strip()
+    if not url:
+        return None
+    return Embedder(url, os.environ.get("EMBED_MODEL", "default"),
+                    os.environ.get("EMBED_API_KEY", ""),
+                    float(os.environ.get("EMBED_TIMEOUT", "10")))
+
+
+def _unit(vec) -> array.array:
+    """float32, L2-normalised, so cosine similarity is a plain dot product."""
+    norm = math.sqrt(sum(x * x for x in vec)) or 1.0
+    return array.array("f", (x / norm for x in vec))
+
+
+_USE_ENV = object()
+_embed_warned = False
+
+
 def _distance(rank: float) -> float:
     """bm25 rank (negative, lower is better) to a [0,1) distance, so 1-d reads as a score.
 
@@ -338,8 +421,12 @@ def _locked(fn):
 class Memory:
     """One user's memory repo: markdown files, a rebuildable index, one git history."""
 
-    def __init__(self, repo: str, create: bool = False):
+    def __init__(self, repo: str, create: bool = False, embedder=_USE_ENV):
+        """`embedder`: an Embedder, None for FTS-only, or (default) built from EMBED_* env."""
         self.repo = Path(repo)
+        self.embedder = embedder_from_env() if embedder is _USE_ENV else embedder
+        self.embed_retry = 30.0  # seconds to leave a failed endpoint alone
+        self._embed_down_until = 0.0
         if create:
             self.repo.mkdir(parents=True, exist_ok=True)
             for memory_type in MEMORY_TYPES:
@@ -448,8 +535,96 @@ class Memory:
                     (memory_type, slug),
                 )
                 changed += 1
+            self.db.execute(
+                "DELETE FROM embeddings WHERE NOT EXISTS (SELECT 1 FROM memories m WHERE "
+                "m.memory_type = embeddings.memory_type AND m.slug = embeddings.slug)"
+            )
             self.db.commit()
+            self._embed_stale()
         return changed
+
+    def _content_hash(self, fact: str) -> str:
+        # The model is part of the hash: switching models re-embeds everything.
+        return hashlib.sha256(f"{self.embedder.model}\0{fact}".encode()).hexdigest()[:32]
+
+    def _embed(self, texts: list[str]):
+        """Embed, or None if embeddings are off or the endpoint is down (FTS-only).
+
+        Never raises: a dead embedding service must not break chat. A failure is
+        logged once per process and the endpoint is left alone for `embed_retry` seconds.
+        """
+        global _embed_warned
+        if self.embedder is None or time.monotonic() < self._embed_down_until:
+            return None
+        try:
+            return self.embedder.embed(texts)
+        except EmbedError as e:
+            if not _embed_warned:
+                _embed_warned = True
+                log_stderr(f"[gitmem] embeddings unavailable, falling back to full-text only: {e}")
+            self._embed_down_until = time.monotonic() + self.embed_retry
+            return None
+
+    def _embed_stale(self, only: tuple | None = None):
+        """Embed every live memory whose Fact text hash differs from its stored vector.
+
+        Only changed facts are sent, so a sync after one edit is one embedding call
+        of one text; with the index deleted every fact is stale, which is the rebuild.
+        """
+        if self.embedder is None:
+            return
+        stale = [
+            (t, s, f) for t, s, f, h in self.db.execute(
+                "SELECT m.memory_type, m.slug, m.fact, e.content_hash FROM memories m "
+                "LEFT JOIN embeddings e ON e.memory_type = m.memory_type AND e.slug = m.slug "
+                "WHERE m.contradicted = 0" + (" AND m.memory_type = ? AND m.slug = ?" if only else ""),
+                only or (),
+            ) if h != self._content_hash(f)
+        ]
+        if not stale:
+            return
+        vectors = self._embed([f for _, _, f in stale])
+        if vectors is None:
+            return  # the next sync retries; stale vectors are simply not used meanwhile
+        for (t, s, f), vec in zip(stale, vectors):
+            unit = _unit(vec)
+            self.db.execute(
+                "INSERT OR REPLACE INTO embeddings (memory_type, slug, content_hash, dim, vector) "
+                "VALUES (?,?,?,?,?)", (t, s, self._content_hash(f), len(unit), unit.tobytes()),
+            )
+        self.db.commit()
+
+    def _vector_search(self, query: str, memory_type: str | None, n: int):
+        """Brute-force cosine over every stored vector, top n. None if unavailable.
+
+        ponytail: pure-Python linear scan — fine to roughly 10k memories per user
+        (dim 384: ~tens of ms per 1k). Past that, add an ANN index (not a stored one).
+        """
+        if self.embedder is None:
+            return None
+        embedded = self._embed([query])
+        if embedded is None:
+            return None
+        q = _unit(embedded[0])
+        sql = ("SELECT m.slug, m.memory_type, m.fact, m.episode, m.pinned, m.used, e.dim, e.vector "
+               "FROM embeddings e JOIN memories m ON m.memory_type = e.memory_type "
+               "AND m.slug = e.slug WHERE m.contradicted = 0")
+        params: list = []
+        if memory_type:
+            sql += " AND m.memory_type = ?"
+            params.append(memory_type)
+        scored = []
+        for row in self.db.execute(sql, params):
+            if row[6] != len(q):
+                continue  # vector from another model: stale until re-embedded
+            v = array.array("f")
+            v.frombytes(row[7])
+            scored.append((sum(map(operator.mul, q, v)), row[:6]))
+        # Nearest neighbours always exist, relevant or not, so keep only the ones within
+        # half of the best similarity (and above the optional EMBED_MIN_SIM floor).
+        top = heapq.nlargest(n, scored, key=lambda x: x[0])
+        floor = max(float(os.environ.get("EMBED_MIN_SIM", "0")), top[0][0] * 0.5) if top else 0.0
+        return [(sim, row) for sim, row in top if sim >= floor]
 
     def _index(self, memory_type: str, file: Path, mtime: float, sig: str):
         parsed = parse(file.read_text(encoding="utf-8"))
@@ -498,6 +673,7 @@ class Memory:
             st = file.stat()
             self._index(memory_type, file, st.st_mtime, f"{st.st_mtime_ns}:{st.st_size}")
             self.db.commit()
+            self._embed_stale((memory_type, slug))
         return slug
 
     @_locked
@@ -554,7 +730,36 @@ class Memory:
 
     @_locked
     def search(self, query: str, memory_type: str = None, n: int = 5) -> list:
-        """Full-text search, best first. Contradicted memories never appear."""
+        """Best matches first; contradicted memories never appear.
+
+        Full-text (FTS5/bm25) alone when embeddings are off or down. With embeddings,
+        the FTS and the cosine rankings are merged by reciprocal rank fusion
+        (score = sum of 1/(60 + rank)), then nudged by the existing signals: a pinned
+        memory and a well-used one rank slightly higher.
+        """
+        if memory_type:
+            check_type(memory_type)
+        if self.embedder is None:
+            return self._fts(query, memory_type, n)
+        vec = self._vector_search(query, memory_type, n * 4)
+        if not vec:
+            return self._fts(query, memory_type, n)
+        fused: dict = {}
+        for rank, hit in enumerate(self._fts(query, memory_type, n * 4), 1):
+            fused[(hit["memory_type"], hit["slug"])] = [1 / (RRF_K + rank), hit]
+        for rank, (sim, row) in enumerate(vec, 1):
+            hit = self._hit(row + (0,))
+            hit["distance"] = max(0.0, 1.0 - sim)
+            entry = fused.setdefault((hit["memory_type"], hit["slug"]), [0.0, hit])
+            entry[0] += 1 / (RRF_K + rank)
+            entry[1]["distance"] = min(entry[1]["distance"], hit["distance"])
+        ranked = sorted(
+            fused.values(),
+            key=lambda e: -e[0] * (1 + 0.25 * e[1]["pinned"]) * (1 + 0.02 * min(e[1]["used"], 10)),
+        )
+        return [h for _, h in ranked[:n]]
+
+    def _fts(self, query: str, memory_type: str | None, n: int) -> list:
         expr = match_expr(query)
         if not expr:
             return []
@@ -572,7 +777,7 @@ class Memory:
         params = [expr]
         if memory_type:
             sql += " AND m.memory_type = ?"
-            params.append(check_type(memory_type))
+            params.append(memory_type)
         # rank < 0 drops no-signal matches: bm25 scores a document that shares only
         # negligible terms at ~0, and returning those pads every search with noise.
         sql += " AND rank < 0 ORDER BY rank LIMIT ?"
@@ -717,7 +922,7 @@ def selftest():
         (repo / "SOUL.md").write_text("# SOUL\n\n## Identity\n- Name: Assistant\n", encoding="utf-8")
         (repo / "USER.md").write_text("# User Profile\n\n## Identity\n- Alice\n", encoding="utf-8")
 
-        mem = Memory(tmp, create=True)
+        mem = Memory(tmp, create=True, embedder=None)
         assert mem.count() == 0
 
         mem.write("USER", "chroma-bloat",
@@ -805,7 +1010,7 @@ def selftest():
         # THE POINT: the index is derived. Delete it, everything comes back.
         before = mem.recall("USER", "chroma disk")
         (repo / INDEX_FILE).unlink()
-        mem = Memory(tmp)
+        mem = Memory(tmp, embedder=None)
         assert mem.count() == 5, mem.count()
         assert mem.recall("USER", "chroma disk") == before
 
@@ -877,7 +1082,7 @@ def selftest():
         subprocess.run(["git", "config", "user.name", "t"], cwd=repo, check=True)
         (repo / ".gitignore").write_text(".git_credentials.json\n", encoding="utf-8")
 
-        mem = Memory(str(repo), create=True)
+        mem = Memory(str(repo), create=True, embedder=None)
         mem.capture("USER", "remember: Alice likes coffee")
         mem.commit("selftest")
 
@@ -895,7 +1100,7 @@ def selftest():
         assert INDEX_FILE in subprocess.run(["git", "ls-files"], cwd=repo,
                                             capture_output=True, text=True).stdout.split()
         (repo / ".gitignore").write_text(".git_credentials.json\n", encoding="utf-8")
-        Memory(str(repo)).commit("after migration")
+        Memory(str(repo), embedder=None).commit("after migration")
         tracked = subprocess.run(["git", "ls-files"], cwd=repo,
                                  capture_output=True, text=True).stdout.split()
         assert INDEX_FILE not in tracked, "reopening must untrack an already-committed index"
