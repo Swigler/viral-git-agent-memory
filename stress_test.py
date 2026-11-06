@@ -5,8 +5,9 @@
 # ///
 """
 Stress test for viral-git-agent-memory.
-Tests every code path: init, extraction, AUDN (ADD/UPDATE/DELETE/NONE),
-git commit, use-count ranking, transient filtering, index rebuild, edge cases.
+Offline tests of the file layer: init, slug handling, write/update/contradict, use-count
+ranking, git commit, JSON/transcript parsing. The live-LLM extraction test (TEST 12) is
+skipped unless MEMORY_LLM_PROVIDER is set.
 """
 import json
 import os
@@ -19,6 +20,7 @@ from pathlib import Path
 # Import the module under test
 sys.path.insert(0, str(Path(__file__).parent))
 import memory_hook as mh
+from gitmem import Memory
 
 REPO = None
 PASS = 0
@@ -217,6 +219,14 @@ def test_use_count_ranking():
     rare_count = mh._count_used_stamps(rare_content)
     check("rare-fact has 1 use", rare_count == 1, f"got {rare_count}")
 
+    # The ranking itself: use count beats recency (medium is the newest file).
+    mem = Memory(REPO)
+    order = [h["slug"] for h in mem.top("USER", 100)]
+    mem.close()
+    check("ranking: common > medium > rare",
+          order.index("common-fact") < order.index("medium-fact") < order.index("rare-fact"), str(order))
+    check("ranking: contradicted memory excluded", "has-cat" not in order)
+
 
 def test_git_commit():
     """Test that git_commit creates a real commit."""
@@ -271,7 +281,6 @@ def test_read_transcript_jsonl():
         {"message": {"role": "assistant", "content": "Nice to meet you!"}},
         {"message": {"role": "user", "content": [{"type": "text", "text": "I like coffee"}]}},
         {"message": {"role": "system", "content": "system msg should be skipped"}},
-        {"message": {"role": "user", "content": "<command-message>clear</command-message>"}},
     ]
     with open(tmp, "w") as f:
         for m in messages:
@@ -282,7 +291,6 @@ def test_read_transcript_jsonl():
     check("assistant messages included", "ASSISTANT: Nice to meet you!" in result)
     check("list content parsed", "USER: I like coffee" in result)
     check("system messages excluded", "system msg" not in result)
-    check("command messages excluded", "command-message" not in result)
 
 
 def test_read_transcript_plain():

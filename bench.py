@@ -35,7 +35,7 @@ def du(path):
 def main():
     shutil.rmtree(OUT, ignore_errors=True)
     rng = random.Random(42)
-    mem = Memory(OUT, create=True)
+    mem = Memory(OUT, create=True, embedder=None)
 
     print(f"writing {TARGET:,} memories one at a time (the Stop-hook pattern)...")
     start = time.time()

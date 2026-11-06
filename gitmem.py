@@ -1,12 +1,14 @@
-"""Git-backed agent memory with real search. Markdown is the truth, SQLite FTS5 is the index.
+"""Git-backed agent memory with real search. Markdown is the truth; the index is derived.
 
 MemPalace's retrieval guts on viral-git-agent-memory's storage model, with the
 vector database removed. Chroma's HNSW index inflated `link_lists.bin` from
 233 KB to 399 GB in twenty minutes doing nothing but small incremental adds, so
-there is deliberately no vector store here — and nothing to corrupt, because the
-index is derived and can be thrown away at any time.
+there is deliberately no vector store: search is SQLite FTS5, plus (optional)
+embeddings kept as plain float32 BLOBs in the same derived SQLite file and scanned
+brute-force. Nothing to corrupt, because the whole index can be thrown away at any
+time and is rebuilt from the markdown.
 
-Layout of a memory repo (viral-git-agent-memory's, unchanged):
+Layout of a memory repo (viral-git's, unchanged):
 
     SOUL.md              base persona   + generated "## Index" of SOUL_memory/
     USER.md              user profile   + generated "## Index" of USER_memory/
@@ -14,30 +16,45 @@ Layout of a memory repo (viral-git-agent-memory's, unchanged):
     USER_memory/<slug>.md
     index.sqlite3        derived FTS5 index, gitignored, rebuilt from the files
 
-What this adds over viral-git today: `load_top_memories()` sorts by pinned →
-use-count → mtime and takes the top N, so the agent can only recall what is
-popular, never what is *relevant*. `Memory.recall()` is a drop-in replacement
-that answers "what do I know about X".
+This module owns the markdown format (render/parse and every file writer, all under
+the one repo lock and written atomically) and the derived index. The server and the
+consolidation hook both go through it, so there is one ranking and one file format.
 
-Zero dependencies — sqlite3, pathlib and subprocess are stdlib, git is already
-required by the repo model.
+POSIX only (fcntl lock via gitops). Zero dependencies — sqlite3 is stdlib, git is
+already required by the repo model.
 """
 
-import fcntl
+import array
+import functools
+import hashlib
+import heapq
+import json
+import math
+import operator
+import os
 import re
 import sqlite3
 import subprocess
+import threading
+import time
 import unicodedata
+import urllib.request
 from datetime import date
 from pathlib import Path
+
+from gitops import (
+    LOCK_FILE, GitError, atomic_write, git_commit, log_stderr, repo_lock, run_git,
+)
 
 MEMORY_TYPES = ("SOUL", "USER")
 BEHAVIOURAL = "SOUL"  # always-loaded into the prompt; recall() never search-ranks it
 FACTUAL = "USER"  # unbounded, asked about directly; this is the side search is for
 INDEX_FILE = "index.sqlite3"
-LOCK_FILE = ".gitmem.lock"
 INDEX_BEGIN = "<!-- gitmem:index:begin -->"
 INDEX_END = "<!-- gitmem:index:end -->"
+DEFAULT_N = 10  # memories per recall; the server and the hook share this one number
+SCHEMA_VERSION = 3
+RRF_K = 60  # reciprocal rank fusion constant
 
 # Derived files that must never enter git: the index is rebuilt from the markdown in
 # seconds, but it is ~2x the size of the markdown and rewritten whole on every commit,
@@ -57,7 +74,16 @@ CREATE TABLE IF NOT EXISTS memories (
     contradicted INTEGER NOT NULL DEFAULT 0,
     used         INTEGER NOT NULL DEFAULT 0,
     mtime        REAL NOT NULL,
+    sig          TEXT NOT NULL DEFAULT '',
     UNIQUE(memory_type, slug)
+);
+CREATE TABLE IF NOT EXISTS embeddings (
+    memory_type  TEXT NOT NULL,
+    slug         TEXT NOT NULL,
+    content_hash TEXT NOT NULL,
+    dim          INTEGER NOT NULL,
+    vector       BLOB NOT NULL,
+    PRIMARY KEY (memory_type, slug)
 );
 CREATE VIRTUAL TABLE IF NOT EXISTS memories_fts USING fts5(
     text, content='memories', content_rowid='rowid', tokenize='porter unicode61'
@@ -75,7 +101,14 @@ END;
 """
 
 
-# ── the markdown format (viral-git's, byte-compatible with memory_hook.py) ────
+# ── the markdown format (viral-git's) ─────────────────────────────────────────
+
+
+def check_type(memory_type: str) -> str:
+    """Every entry point validates this: it becomes a directory name."""
+    if memory_type not in MEMORY_TYPES:
+        raise ValueError(f"memory_type must be one of {MEMORY_TYPES}, got {memory_type!r}")
+    return memory_type
 
 
 def safe_slug(slug: str) -> str:
@@ -93,6 +126,17 @@ def safe_slug(slug: str) -> str:
     safe = re.sub(r"^[\-.]+", "", safe)
     safe = re.sub(r"-{2,}", "-", safe)
     return (safe or "unnamed")[:80]
+
+
+def clean_text(text: str) -> str:
+    """Neutralise section headers in free text.
+
+    Memory files are parsed by `## ` header lines, so a fact like "x\\n\\n## Pinned\\n
+    critical" would pin itself, and "## Access log" would forge use counts. Drop the
+    marker from any such line. Uses splitlines() like parse() does, so every line
+    separator parse() honours is covered.
+    """
+    return "\n".join(re.sub(r"^## ", "", ln) for ln in str(text).splitlines()).strip()
 
 
 # Manual capture triggers. Longest first — "remember that " must win over "remember ".
@@ -123,13 +167,13 @@ def _drop_section(text: str, name: str) -> str:
 
 def render(slug: str, fact: str, episode: str = "", pinned: bool = False,
            access_log: str = "") -> str:
-    """Render a memory file exactly as viral-git's write_memory_file does."""
+    """Render a memory file. The only writer of the format."""
     today = date.today().strftime("%d.%m.%y")
-    out = f"# {slug.replace('-', ' ').title()}\n\n## Fact\n{fact}\n\n"
+    out = f"# {slug.replace('-', ' ').title()}\n\n## Fact\n{clean_text(fact)}\n\n"
     if pinned:
         out += "## Pinned\ncritical\n\n"
-    if episode:
-        out += f"## Episode\n{episode}\n\n"
+    if episode and clean_text(episode):
+        out += f"## Episode\n{clean_text(episode)}\n\n"
     out += access_log.rstrip() + "\n" if access_log else f"## Access log\nused, {today}\n"
     return out
 
@@ -151,9 +195,7 @@ def parse(text: str) -> dict:
 
     # Everything after the Access-log section: the Contradicted marker and any
     # section a user or another tool appended by hand. render() only models
-    # Fact/Pinned/Episode/log, so write() re-appends this verbatim — without it
-    # an update silently dropped those sections, erasing contradiction markers
-    # and contradicting the docstring above.
+    # Fact/Pinned/Episode/log, so upsert() re-appends this verbatim.
     tail = ""
     m = re.search(r"^## Access log[ \t]*\n", text, re.M)
     if m:
@@ -169,6 +211,97 @@ def parse(text: str) -> dict:
         "access_log": f"## Access log\n{log}" if log else "",
         "tail": tail,
     }
+
+
+def _file(repo, memory_type: str, slug: str) -> Path:
+    return Path(repo) / f"{check_type(memory_type)}_memory" / f"{safe_slug(slug)}.md"
+
+
+def upsert(repo, memory_type: str, slug: str, fact: str, episode: str = "",
+           pinned: bool = False, stamp: bool = False) -> str:
+    """Create or rewrite one memory file. Returns the slug actually used.
+
+    Preserves the sections that carry state: the access log (popularity) and
+    `## Pinned`, plus hand-added sections. `## Contradicted` is deliberately
+    dropped: writing a fact means it was just refined, so it is valid again.
+    `stamp` appends a `used,` line (an UPDATE counts as a use).
+    """
+    if not clean_text(fact):
+        raise ValueError("fact must not be empty")
+    slug = safe_slug(slug)
+    file = _file(repo, memory_type, slug)
+    file.parent.mkdir(parents=True, exist_ok=True)
+    with repo_lock(repo):
+        existing = parse(file.read_text(encoding="utf-8")) if file.exists() else {}
+        log = existing.get("access_log", "")
+        if stamp:
+            log = (log or "## Access log") + f"\nused, {date.today().strftime('%d.%m.%y')}"
+        out = render(slug, fact, episode, pinned or existing.get("pinned", False), log)
+        tail = _drop_section(existing.get("tail", ""), "Contradicted")
+        if tail:
+            out = out.rstrip("\n") + "\n\n" + tail + "\n"
+        atomic_write(file, out)
+    return slug
+
+
+def create(repo, memory_type: str, slug: str, fact: str, episode: str = "",
+           pinned: bool = False, seen_slugs: set | None = None) -> str:
+    """Write a NEW memory; a colliding slug (on disk or in this batch) gets a suffix."""
+    if not clean_text(fact):
+        raise ValueError("fact must not be empty")
+    base = safe_slug(slug)
+    file = _file(repo, memory_type, base)
+    file.parent.mkdir(parents=True, exist_ok=True)
+    with repo_lock(repo):
+        slug, counter = base, 2
+        while (file.parent / f"{slug}.md").exists() or (seen_slugs is not None and slug in seen_slugs):
+            slug = f"{base}-{counter}"
+            counter += 1
+            if counter > 50:  # safety valve
+                slug = f"{base}-{date.today().strftime('%Y%m%d')}-{counter}"
+                break
+        if seen_slugs is not None:
+            seen_slugs.add(slug)
+        atomic_write(file.parent / f"{slug}.md", render(slug, fact, episode, pinned))
+    if slug != base:
+        log_stderr(f"[write] slug collision: {base} → {slug}")
+    return slug
+
+
+def mark_contradicted(repo, memory_type: str, slug: str) -> bool:
+    """Append a `## Contradicted` section. False if the memory does not exist."""
+    file = _file(repo, memory_type, slug)
+    with repo_lock(repo):
+        if not file.exists():
+            return False
+        content = file.read_text(encoding="utf-8")
+        if not parse(content)["contradicted"]:
+            marked = f"\n## Contradicted\nMarked contradicted on {date.today().strftime('%d.%m.%y')}\n"
+            atomic_write(file, content.rstrip("\n") + "\n" + marked)
+    return True
+
+
+def stamp_used(repo, memory_type: str, slug: str) -> bool:
+    """Append a `used,` stamp INSIDE the Access log section, leaving everything else as is."""
+    file = _file(repo, memory_type, slug)
+    with repo_lock(repo):
+        if not file.exists():
+            return False
+        lines = file.read_text(encoding="utf-8").splitlines()
+        stamp = f"used, {date.today().strftime('%d.%m.%y')}"
+        head = next((i for i, ln in enumerate(lines)
+                     if re.fullmatch(r"## Access log[ \t]*", ln)), None)
+        if head is None:
+            lines += ["", "## Access log", stamp]
+        else:
+            end = head + 1
+            while end < len(lines) and not lines[end].startswith("## "):
+                end += 1
+            while end > head + 1 and not lines[end - 1].strip():
+                end -= 1
+            lines.insert(end, stamp)
+        atomic_write(file, "\n".join(lines).rstrip("\n") + "\n")
+    return True
 
 
 # Function words carry no signal but appear in nearly every memory, so OR-ing them
@@ -202,29 +335,84 @@ def match_expr(query: str) -> str:
     return " OR ".join(f'"{w}"' for w in words)
 
 
+# ── embeddings (optional, derived) ────────────────────────────────────────────
+
+
+class EmbedError(RuntimeError):
+    pass
+
+
+class Embedder:
+    """OpenAI-compatible embeddings over HTTP: POST {url}/v1/embeddings {model, input}.
+
+    Works with llama-server --embedding, vLLM, Ollama's /v1 endpoint, OpenAI, ...
+    """
+
+    def __init__(self, url: str, model: str, api_key: str = "", timeout: float = 10.0,
+                 batch: int = 32):
+        self.url, self.model = url.rstrip("/"), model
+        self.api_key, self.timeout, self.batch = api_key, timeout, batch
+
+    def embed(self, texts: list[str]) -> list[list[float]]:
+        out: list[list[float]] = []
+        for i in range(0, len(texts), self.batch):
+            out += self._call(texts[i:i + self.batch])
+        return out
+
+    def _call(self, texts: list[str]) -> list[list[float]]:
+        req = urllib.request.Request(
+            f"{self.url}/v1/embeddings",
+            data=json.dumps({"model": self.model, "input": texts}).encode(),
+            headers={"Content-Type": "application/json",
+                     **({"Authorization": f"Bearer {self.api_key}"} if self.api_key else {})},
+            method="POST",
+        )
+        try:
+            with urllib.request.urlopen(req, timeout=self.timeout) as resp:
+                data = sorted(json.loads(resp.read())["data"], key=lambda d: d["index"])
+            vectors = [[float(x) for x in d["embedding"]] for d in data]
+        except Exception as e:  # noqa: BLE001 — any failure means "no embeddings this time"
+            raise EmbedError(f"{self.url}: {e}") from e
+        if len(vectors) != len(texts) or len({len(v) for v in vectors}) > 1:
+            raise EmbedError(f"{self.url}: got {len(vectors)} vectors for {len(texts)} inputs")
+        return vectors
+
+
+def embedder_from_env() -> "Embedder | None":
+    """EMBED_URL, EMBED_MODEL, EMBED_API_KEY (optional), EMBED_TIMEOUT. Unset URL = off."""
+    url = os.environ.get("EMBED_URL", "").strip()
+    if not url:
+        return None
+    return Embedder(url, os.environ.get("EMBED_MODEL", "default"),
+                    os.environ.get("EMBED_API_KEY", ""),
+                    float(os.environ.get("EMBED_TIMEOUT", "10")))
+
+
+def _unit(vec) -> array.array:
+    """float32, L2-normalised, so cosine similarity is a plain dot product."""
+    norm = math.sqrt(sum(x * x for x in vec)) or 1.0
+    return array.array("f", (x / norm for x in vec))
+
+
+_USE_ENV = object()
+_embed_warned = False
+
+
 def _distance(rank: float) -> float:
     """bm25 rank (negative, lower is better) to a [0,1) distance, so 1-d reads as a score.
 
-    ponytail: monotone squash, not a calibrated similarity. If these numbers ever
-    have to mean something, that is the point to add real embeddings.
+    ponytail: monotone squash, not a calibrated similarity.
     """
     return 1.0 / (1.0 + max(0.0, -rank))
 
 
-class _lock:
-    """Exclusive per-repo lock. viral-git already locks consolidations; writes need it too."""
-
-    def __init__(self, repo):
-        self._path = Path(repo) / LOCK_FILE
-
-    def __enter__(self):
-        self._fh = open(self._path, "w")
-        fcntl.flock(self._fh, fcntl.LOCK_EX)
-        return self
-
-    def __exit__(self, *exc):
-        fcntl.flock(self._fh, fcntl.LOCK_UN)
-        self._fh.close()
+def _locked(fn):
+    """Serialise use of the sqlite connection: one Memory can be shared across threads."""
+    @functools.wraps(fn)
+    def wrapper(self, *args, **kwargs):
+        with self._mu:
+            return fn(self, *args, **kwargs)
+    return wrapper
 
 
 # ── the memory repo ───────────────────────────────────────────────────────────
@@ -233,26 +421,55 @@ class _lock:
 class Memory:
     """One user's memory repo: markdown files, a rebuildable index, one git history."""
 
-    def __init__(self, repo: str, create: bool = False):
+    def __init__(self, repo: str, create: bool = False, embedder=_USE_ENV):
+        """`embedder`: an Embedder, None for FTS-only, or (default) built from EMBED_* env."""
         self.repo = Path(repo)
+        self.embedder = embedder_from_env() if embedder is _USE_ENV else embedder
+        self.embed_retry = 30.0  # seconds to leave a failed endpoint alone
+        self._embed_down_until = 0.0
         if create:
             self.repo.mkdir(parents=True, exist_ok=True)
             for memory_type in MEMORY_TYPES:
                 (self.repo / f"{memory_type}_memory").mkdir(exist_ok=True)
             if not (self.repo / ".git").is_dir():
-                subprocess.run(["git", "init", "-q"], cwd=self.repo, capture_output=True)
+                run_git(self.repo, "init", "-q", check=True)
         elif not self.repo.is_dir():
             raise FileNotFoundError(repo)
 
+        self._mu = threading.RLock()
         # Before the index file is created, not only when creating the repo: repos
         # seeded from template/ already have a .gitignore, and the old "write one if
         # absent" left those tracking the index forever.
         self._ensure_derived_ignored()
-
-        self.db = sqlite3.connect(self.repo / INDEX_FILE)
-        self.db.executescript(_SCHEMA)
-        self.db.commit()
+        self.db = self._open()
         self.sync()
+
+    def _open(self) -> sqlite3.Connection:
+        """Open the derived index; a stale schema or corrupt file is simply rebuilt."""
+        path = self.repo / INDEX_FILE
+        with repo_lock(self.repo):
+            for _ in range(2):
+                # check_same_thread=False: the server shares one Memory across request
+                # threads; _mu serialises every use.
+                db = sqlite3.connect(path, check_same_thread=False, timeout=30)
+                try:
+                    fresh = db.execute("SELECT count(*) FROM sqlite_master").fetchone()[0] == 0
+                    if not fresh and db.execute("PRAGMA user_version").fetchone()[0] != SCHEMA_VERSION:
+                        raise sqlite3.DatabaseError("stale index schema")
+                    db.execute("PRAGMA journal_mode=WAL")
+                    db.executescript(_SCHEMA)
+                    db.execute(f"PRAGMA user_version={SCHEMA_VERSION}")
+                    db.commit()
+                    return db
+                except sqlite3.DatabaseError:
+                    db.close()
+                    for suffix in ("", "-wal", "-shm"):
+                        Path(f"{path}{suffix}").unlink(missing_ok=True)
+        raise sqlite3.DatabaseError(f"cannot open index {path}")
+
+    def close(self):
+        with self._mu:
+            self.db.close()
 
     def _ensure_derived_ignored(self):
         """Append any missing DERIVED entries to .gitignore, and untrack them once.
@@ -267,34 +484,33 @@ class Memory:
         missing = [name for name in DERIVED if name not in present]
         if not missing:
             return
-
-        with open(gitignore, "a", encoding="utf-8") as f:
-            if content and not content.endswith("\n"):
-                f.write("\n")
-            f.write("\n".join(missing) + "\n")
+        sep = "\n" if content and not content.endswith("\n") else ""
+        atomic_write(gitignore, content + sep + "\n".join(missing) + "\n")
 
         # Migration for repos that already committed the index: .gitignore does not
         # apply to tracked files, so it has to leave the index too. --cached keeps the
         # file on disk, and --ignore-unmatch makes this a no-op on a clean repo.
         if (self.repo / ".git").is_dir():
-            subprocess.run(
-                ["git", "rm", "--cached", "-q", "--ignore-unmatch", *DERIVED],
-                cwd=self.repo, capture_output=True,
-            )
+            try:
+                run_git(self.repo, "rm", "--cached", "-q", "--ignore-unmatch", *DERIVED)
+            except subprocess.TimeoutExpired:
+                log_stderr("[gitmem] git rm --cached timed out")
 
     # -- index -------------------------------------------------------------
 
+    @_locked
     def sync(self) -> int:
         """Reconcile the index with the files on disk. The files always win.
 
-        Called on open, so memory_hook.py can keep writing files directly without
-        knowing this index exists — anything it changed is picked up here.
+        Called on open, and by the server before each recall, so memory_hook.py can
+        keep writing files without knowing this index exists. A file counts as changed
+        when its (mtime_ns, size) differs from what was indexed.
         """
         changed = 0
-        with _lock(self.repo):
+        with repo_lock(self.repo):
             known = {
                 (r[0], r[1]): r[2]
-                for r in self.db.execute("SELECT memory_type, slug, mtime FROM memories")
+                for r in self.db.execute("SELECT memory_type, slug, sig FROM memories")
             }
             seen = set()
             for memory_type in MEMORY_TYPES:
@@ -302,12 +518,16 @@ class Memory:
                 if not directory.is_dir():
                     continue
                 for file in sorted(directory.glob("*.md")):
+                    try:
+                        st = file.stat()
+                    except FileNotFoundError:
+                        continue
                     key = (memory_type, file.stem)
                     seen.add(key)
-                    mtime = file.stat().st_mtime
-                    if known.get(key) == mtime:
+                    sig = f"{st.st_mtime_ns}:{st.st_size}"
+                    if known.get(key) == sig:
                         continue
-                    self._index(memory_type, file, mtime)
+                    self._index(memory_type, file, st.st_mtime, sig)
                     changed += 1
             for memory_type, slug in known.keys() - seen:
                 self.db.execute(
@@ -315,21 +535,109 @@ class Memory:
                     (memory_type, slug),
                 )
                 changed += 1
+            self.db.execute(
+                "DELETE FROM embeddings WHERE NOT EXISTS (SELECT 1 FROM memories m WHERE "
+                "m.memory_type = embeddings.memory_type AND m.slug = embeddings.slug)"
+            )
             self.db.commit()
+            self._embed_stale()
         return changed
 
-    def _index(self, memory_type: str, file: Path, mtime: float):
+    def _content_hash(self, fact: str) -> str:
+        # The model is part of the hash: switching models re-embeds everything.
+        return hashlib.sha256(f"{self.embedder.model}\0{fact}".encode()).hexdigest()[:32]
+
+    def _embed(self, texts: list[str]):
+        """Embed, or None if embeddings are off or the endpoint is down (FTS-only).
+
+        Never raises: a dead embedding service must not break chat. A failure is
+        logged once per process and the endpoint is left alone for `embed_retry` seconds.
+        """
+        global _embed_warned
+        if self.embedder is None or time.monotonic() < self._embed_down_until:
+            return None
+        try:
+            return self.embedder.embed(texts)
+        except EmbedError as e:
+            if not _embed_warned:
+                _embed_warned = True
+                log_stderr(f"[gitmem] embeddings unavailable, falling back to full-text only: {e}")
+            self._embed_down_until = time.monotonic() + self.embed_retry
+            return None
+
+    def _embed_stale(self, only: tuple | None = None):
+        """Embed every live memory whose Fact text hash differs from its stored vector.
+
+        Only changed facts are sent, so a sync after one edit is one embedding call
+        of one text; with the index deleted every fact is stale, which is the rebuild.
+        """
+        if self.embedder is None:
+            return
+        stale = [
+            (t, s, f) for t, s, f, h in self.db.execute(
+                "SELECT m.memory_type, m.slug, m.fact, e.content_hash FROM memories m "
+                "LEFT JOIN embeddings e ON e.memory_type = m.memory_type AND e.slug = m.slug "
+                "WHERE m.contradicted = 0" + (" AND m.memory_type = ? AND m.slug = ?" if only else ""),
+                only or (),
+            ) if h != self._content_hash(f)
+        ]
+        if not stale:
+            return
+        vectors = self._embed([f for _, _, f in stale])
+        if vectors is None:
+            return  # the next sync retries; stale vectors are simply not used meanwhile
+        for (t, s, f), vec in zip(stale, vectors):
+            unit = _unit(vec)
+            self.db.execute(
+                "INSERT OR REPLACE INTO embeddings (memory_type, slug, content_hash, dim, vector) "
+                "VALUES (?,?,?,?,?)", (t, s, self._content_hash(f), len(unit), unit.tobytes()),
+            )
+        self.db.commit()
+
+    def _vector_search(self, query: str, memory_type: str | None, n: int):
+        """Brute-force cosine over every stored vector, top n. None if unavailable.
+
+        ponytail: pure-Python linear scan — fine to roughly 10k memories per user
+        (dim 384: ~tens of ms per 1k). Past that, add an ANN index (not a stored one).
+        """
+        if self.embedder is None:
+            return None
+        embedded = self._embed([query])
+        if embedded is None:
+            return None
+        q = _unit(embedded[0])
+        sql = ("SELECT m.slug, m.memory_type, m.fact, m.episode, m.pinned, m.used, e.dim, e.vector "
+               "FROM embeddings e JOIN memories m ON m.memory_type = e.memory_type "
+               "AND m.slug = e.slug WHERE m.contradicted = 0")
+        params: list = []
+        if memory_type:
+            sql += " AND m.memory_type = ?"
+            params.append(memory_type)
+        scored = []
+        for row in self.db.execute(sql, params):
+            if row[6] != len(q):
+                continue  # vector from another model: stale until re-embedded
+            v = array.array("f")
+            v.frombytes(row[7])
+            scored.append((sum(map(operator.mul, q, v)), row[:6]))
+        # Nearest neighbours always exist, relevant or not, so keep only the ones within
+        # half of the best similarity (and above the optional EMBED_MIN_SIM floor).
+        top = heapq.nlargest(n, scored, key=lambda x: x[0])
+        floor = max(float(os.environ.get("EMBED_MIN_SIM", "0")), top[0][0] * 0.5) if top else 0.0
+        return [(sim, row) for sim, row in top if sim >= floor]
+
+    def _index(self, memory_type: str, file: Path, mtime: float, sig: str):
         parsed = parse(file.read_text(encoding="utf-8"))
         searchable = " ".join(
             [file.stem.replace("-", " "), parsed["fact"], parsed["episode"]]
         )
         self.db.execute(
             "INSERT INTO memories (slug, memory_type, path, text, fact, episode, "
-            "pinned, contradicted, used, mtime) VALUES (?,?,?,?,?,?,?,?,?,?) "
+            "pinned, contradicted, used, mtime, sig) VALUES (?,?,?,?,?,?,?,?,?,?,?) "
             "ON CONFLICT(memory_type, slug) DO UPDATE SET path=excluded.path, "
             "text=excluded.text, fact=excluded.fact, episode=excluded.episode, "
             "pinned=excluded.pinned, contradicted=excluded.contradicted, "
-            "used=excluded.used, mtime=excluded.mtime",
+            "used=excluded.used, mtime=excluded.mtime, sig=excluded.sig",
             (
                 file.stem,
                 memory_type,
@@ -341,50 +649,34 @@ class Memory:
                 int(parsed["contradicted"]),
                 parsed["used"],
                 mtime,
+                sig,
             ),
         )
 
+    @_locked
     def reindex(self) -> int:
         """Throw the index away and rebuild it from the files. Always safe."""
-        with _lock(self.repo):
+        with repo_lock(self.repo):
             self.db.execute("DELETE FROM memories")
             self.db.commit()
-        return self.sync()
+            return self.sync()
 
     # -- writes ------------------------------------------------------------
 
+    @_locked
     def write(self, memory_type: str, slug: str, fact: str, episode: str = "",
               pinned: bool = False) -> str:
         """Create or update one memory. Returns the slug actually used."""
-        if memory_type not in MEMORY_TYPES:
-            raise ValueError(f"memory_type must be one of {MEMORY_TYPES}, got {memory_type!r}")
-        if not fact.strip():
-            raise ValueError("fact must not be empty")
-
-        slug = safe_slug(slug)
-        directory = self.repo / f"{memory_type}_memory"
-        directory.mkdir(parents=True, exist_ok=True)
-        file = directory / f"{slug}.md"
-
-        with _lock(self.repo):
-            # Preserve the access log across updates, as update_memory_file does.
-            existing = parse(file.read_text(encoding="utf-8")) if file.exists() else {}
-            out = render(slug, fact, episode, pinned or existing.get("pinned", False),
-                         existing.get("access_log", ""))
-            # Re-append hand-added sections render() doesn't model, so an update
-            # doesn't silently erase them — but NOT "## Contradicted": writing a
-            # fact means it was just refined, so it is valid again. That is the
-            # rule memory_hook.update_memory_file applies (pass 2 #21, whose
-            # docstring names this method as the reference). Keeping the marker
-            # made the freshly written fact invisible to search and recall.
-            tail = _drop_section(existing.get("tail", ""), "Contradicted")
-            if tail:
-                out = out.rstrip("\n") + "\n\n" + tail + "\n"
-            file.write_text(out, encoding="utf-8")
-            self._index(memory_type, file, file.stat().st_mtime)
+        with repo_lock(self.repo):
+            slug = upsert(self.repo, memory_type, slug, fact, episode, pinned)
+            file = _file(self.repo, memory_type, slug)
+            st = file.stat()
+            self._index(memory_type, file, st.st_mtime, f"{st.st_mtime_ns}:{st.st_size}")
             self.db.commit()
+            self._embed_stale((memory_type, slug))
         return slug
 
+    @_locked
     def capture(self, memory_type: str, message: str, pinned: bool = False):
         """Manual capture — "remember: Alice lives in Bucharest". No model, just a parse.
 
@@ -395,6 +687,7 @@ class Memory:
         Returns the slug written, or None if the message was not a capture — so the
         caller can hand it every inbound message and act on the result.
         """
+        check_type(memory_type)
         text = (message or "").strip()
         lowered = text.lower()
         for prefix in CAPTURE_PREFIXES:
@@ -406,37 +699,67 @@ class Memory:
         if not fact:
             return None
 
-        # Never overwrite an existing memory. write() is an upsert by design, but two
-        # unrelated facts can derive the same slug, and silently losing one is the
-        # worst thing a memory system can do. Saying the same thing twice, on the
-        # other hand, should not pile up duplicates — that makes a log, not a memory.
+        # Never overwrite an existing memory. Two unrelated facts can derive the same
+        # slug, and silently losing one is the worst thing a memory system can do.
+        # Saying the same thing twice, on the other hand, should not pile up
+        # duplicates — that makes a log, not a memory.
         base = slug_from(fact)
         directory = self.repo / f"{memory_type}_memory"
-        slug, counter = base, 2
-        while (directory / f"{slug}.md").exists():
-            if parse((directory / f"{slug}.md").read_text(encoding="utf-8"))["fact"] == fact:
-                return slug
-            slug = f"{base}-{counter}"
-            counter += 1
-        return self.write(memory_type, slug, fact, pinned=pinned)
+        with repo_lock(self.repo):
+            slug, counter = base, 2
+            while (directory / f"{slug}.md").exists():
+                if parse((directory / f"{slug}.md").read_text(encoding="utf-8"))["fact"] == clean_text(fact):
+                    return slug
+                slug = f"{base}-{counter}"
+                counter += 1
+            return self.write(memory_type, slug, fact, pinned=pinned)
 
+    @_locked
     def delete(self, memory_type: str, slug: str) -> bool:
         """Remove a memory: the file and its index row."""
-        slug = safe_slug(slug)
-        file = self.repo / f"{memory_type}_memory" / f"{slug}.md"
-        with _lock(self.repo):
+        file = _file(self.repo, memory_type, slug)
+        with repo_lock(self.repo):
             existed = file.exists()
             file.unlink(missing_ok=True)
-            self.db.execute(
-                "DELETE FROM memories WHERE memory_type = ? AND slug = ?", (memory_type, slug)
-            )
+            self.db.execute("DELETE FROM memories WHERE memory_type = ? AND slug = ?",
+                            (memory_type, file.stem))
             self.db.commit()
         return existed
 
     # -- reads -------------------------------------------------------------
 
+    @_locked
     def search(self, query: str, memory_type: str = None, n: int = 5) -> list:
-        """Full-text search, best first. This is what viral-git has no way to do."""
+        """Best matches first; contradicted memories never appear.
+
+        Full-text (FTS5/bm25) alone when embeddings are off or down. With embeddings,
+        the FTS and the cosine rankings are merged by reciprocal rank fusion
+        (score = sum of 1/(60 + rank)), then nudged by the existing signals: a pinned
+        memory and a well-used one rank slightly higher.
+        """
+        if memory_type:
+            check_type(memory_type)
+        if self.embedder is None:
+            return self._fts(query, memory_type, n)
+        vec = self._vector_search(query, memory_type, n * 4)
+        if not vec:
+            return self._fts(query, memory_type, n)
+        fused: dict = {}
+        for rank, hit in enumerate(self._fts(query, memory_type, n * 4), 1):
+            fused[(hit["memory_type"], hit["slug"])] = [1 / (RRF_K + rank), hit]
+        for rank, (sim, row) in enumerate(vec, 1):
+            hit = self._hit(row + (0,))
+            hit["distance"] = max(0.0, 1.0 - sim)
+            entry = fused.setdefault((hit["memory_type"], hit["slug"]), [0.0, hit])
+            entry[0] += 1 / (RRF_K + rank)
+            entry[1]["distance"] = min(entry[1]["distance"], hit["distance"])
+        ranked = sorted(
+            fused.values(),
+            key=lambda e: -e[0] * (1 + 0.25 * e[1]["pinned"]) * (1 + 0.02 * min(e[1]["used"], 10)),
+        )
+        return [h for _, h in ranked[:n]]
+
+    def _fts(self, query: str, memory_type: str | None, n: int) -> list:
         expr = match_expr(query)
         if not expr:
             return []
@@ -461,23 +784,25 @@ class Memory:
         params.append(n)
         return [self._hit(r) for r in self.db.execute(sql, params)]
 
-    def top(self, memory_type: str, n: int = 15) -> list:
-        """viral-git's existing ranking: pinned, then use count, then recency."""
+    @_locked
+    def top(self, memory_type: str, n: int = DEFAULT_N) -> list:
+        """The one ranking: pinned, then use count, then recency. Never contradicted."""
         rows = self.db.execute(
             "SELECT slug, memory_type, fact, episode, pinned, used, 0 FROM memories "
             "WHERE memory_type = ? AND contradicted = 0 "
             "ORDER BY pinned DESC, used DESC, mtime DESC LIMIT ?",
-            (memory_type, n),
+            (check_type(memory_type), n),
         )
         return [self._hit(r) for r in rows]
 
-    def recall(self, memory_type: str, query: str = "", n: int = 15) -> str:
-        """Drop-in for load_top_memories(): the same "- fact" block, relevance-ranked.
+    @_locked
+    def recall(self, memory_type: str, query: str = "", n: int = DEFAULT_N) -> str:
+        """The "- fact" block for the prompt, relevance-ranked.
 
-        Pinned memories always lead — they are the ones marked as always-load, and
-        a keyword query must not be able to push them out. Relevant hits follow,
-        then the popular ones backfill to n. With no query this is exactly the old
-        behaviour, so it is safe to call unconditionally.
+        Pinned memories lead — they are the ones marked as always-load, and a keyword
+        query must not push them out — but at most n//2 of them, so a pile of pins
+        cannot crowd out everything else. Relevant hits follow, then the popular ones
+        backfill to n. With no query this is pure popularity order.
 
         BEHAVIOURAL memory ignores the query on purpose. SOUL_memory holds how the
         agent should act — it is small, bounded, and the user never asks about it,
@@ -488,12 +813,12 @@ class Memory:
         limit and the user asks about it directly, which is what search is for.
         `search()` still works on either side for callers that explicitly want it.
         """
-        if memory_type == BEHAVIOURAL:
+        if check_type(memory_type) == BEHAVIOURAL:
             query = ""
 
         chosen, seen = [], set()
-        for hit in self._pinned(memory_type) + self.search(query, memory_type, n) + \
-                self.top(memory_type, n):
+        pinned = self._pinned(memory_type)[: max(1, n // 2)]
+        for hit in pinned + self.search(query, memory_type, n) + self.top(memory_type, n):
             if hit["slug"] in seen:
                 continue
             seen.add(hit["slug"])
@@ -502,6 +827,7 @@ class Memory:
                 break
         return "\n".join(f"- {h['fact']}" for h in chosen)
 
+    @_locked
     def _pinned(self, memory_type: str) -> list:
         rows = self.db.execute(
             "SELECT slug, memory_type, fact, episode, pinned, used, 0 FROM memories "
@@ -517,15 +843,17 @@ class Memory:
             "pinned": bool(row[4]), "used": row[5], "distance": _distance(row[6]),
         }
 
+    @_locked
     def count(self, memory_type: str = None) -> int:
         if memory_type:
             return self.db.execute(
-                "SELECT COUNT(*) FROM memories WHERE memory_type = ?", (memory_type,)
+                "SELECT COUNT(*) FROM memories WHERE memory_type = ?", (check_type(memory_type),)
             ).fetchone()[0]
         return self.db.execute("SELECT COUNT(*) FROM memories").fetchone()[0]
 
     # -- the two index files, and git --------------------------------------
 
+    @_locked
     def write_indexes(self):
         """Regenerate the "## Index" block in SOUL.md and USER.md.
 
@@ -533,51 +861,53 @@ class Memory:
         USER.md — is what assemble_context() injects into the system prompt, so it
         is preserved untouched; only the marked block below it is rewritten.
         """
-        for memory_type in MEMORY_TYPES:
-            rows = self.db.execute(
-                "SELECT slug, path, fact, pinned FROM memories WHERE memory_type = ? "
-                "ORDER BY pinned DESC, slug",
-                (memory_type,),
-            ).fetchall()
-            lines = [
-                INDEX_BEGIN,
-                "## Index",
-                "",
-                f"{len(rows)} memories in `{memory_type}_memory/`. "
-                "Generated — edit the memory files, not this block.",
-                "",
-            ]
-            for slug, path, fact, pinned in rows:
-                summary = " ".join(fact.split())[:160]
-                pin = "📌 " if pinned else ""
-                lines.append(f"- {pin}[`{slug}`]({path}) — {summary}")
-            block = "\n".join(lines + ["", INDEX_END])
+        with repo_lock(self.repo):
+            self.sync()
+            for memory_type in MEMORY_TYPES:
+                rows = self.db.execute(
+                    "SELECT slug, path, fact, pinned FROM memories WHERE memory_type = ? "
+                    "ORDER BY pinned DESC, slug",
+                    (memory_type,),
+                ).fetchall()
+                lines = [
+                    INDEX_BEGIN,
+                    "## Index",
+                    "",
+                    f"{len(rows)} memories in `{memory_type}_memory/`. "
+                    "Generated — edit the memory files, not this block.",
+                    "",
+                ]
+                for slug, path, fact, pinned in rows:
+                    summary = " ".join(fact.split())[:160]
+                    pin = "📌 " if pinned else ""
+                    lines.append(f"- {pin}[`{slug}`]({path}) — {summary}")
+                block = "\n".join(lines + ["", INDEX_END])
 
-            file = self.repo / f"{memory_type}.md"
-            old = file.read_text(encoding="utf-8") if file.exists() else ""
-            start, end = old.find(INDEX_BEGIN), old.find(INDEX_END)
-            if start != -1 and end != -1:
-                new = old[:start] + block + old[end + len(INDEX_END):]
-            else:
-                new = (old.rstrip() + "\n\n" if old.strip() else "") + block + "\n"
-            file.write_text(new, encoding="utf-8")
+                file = self.repo / f"{memory_type}.md"
+                old = file.read_text(encoding="utf-8") if file.exists() else ""
+                start, end = old.find(INDEX_BEGIN), old.find(INDEX_END)
+                if start != -1 and end != -1:
+                    new = old[:start] + block + old[end + len(INDEX_END):]
+                else:
+                    new = (old.rstrip() + "\n\n" if old.strip() else "") + block + "\n"
+                atomic_write(file, new)
 
     def commit(self, message: str = None) -> bool:
-        """Regenerate the index files and make ONE commit.
+        """Regenerate the index files and make ONE commit (via gitops.git_commit, the
+        same commit+push path the consolidation hook uses).
+
+        True if a commit was made, False if there was nothing to commit; raises
+        GitError if the commit failed.
 
         Deliberately not called per write. MemPalace's Stop hook fired after every
         assistant turn; a commit per memory is thousands of commits a day, and that
         write pattern is what shredded the Chroma index in the first place.
         """
         self.write_indexes()
-        if not (self.repo / ".git").is_dir():
-            return False
-        message = message or f"memory checkpoint {date.today().strftime('%d.%m.%y')}"
-        subprocess.run(["git", "add", "-A"], cwd=self.repo, capture_output=True)
-        done = subprocess.run(
-            ["git", "commit", "-m", message], cwd=self.repo, capture_output=True, text=True
-        )
-        return done.returncode == 0
+        status = git_commit(self.repo, message or f"memory checkpoint {date.today().strftime('%d.%m.%y')}")
+        if status == "failed":
+            raise GitError("commit failed (see log)")
+        return status == "committed"
 
 
 # ── check ─────────────────────────────────────────────────────────────────────
@@ -592,7 +922,7 @@ def selftest():
         (repo / "SOUL.md").write_text("# SOUL\n\n## Identity\n- Name: Assistant\n", encoding="utf-8")
         (repo / "USER.md").write_text("# User Profile\n\n## Identity\n- Alice\n", encoding="utf-8")
 
-        mem = Memory(tmp, create=True)
+        mem = Memory(tmp, create=True, embedder=None)
         assert mem.count() == 0
 
         mem.write("USER", "chroma-bloat",
@@ -680,7 +1010,7 @@ def selftest():
         # THE POINT: the index is derived. Delete it, everything comes back.
         before = mem.recall("USER", "chroma disk")
         (repo / INDEX_FILE).unlink()
-        mem = Memory(tmp)
+        mem = Memory(tmp, embedder=None)
         assert mem.count() == 5, mem.count()
         assert mem.recall("USER", "chroma disk") == before
 
@@ -752,7 +1082,7 @@ def selftest():
         subprocess.run(["git", "config", "user.name", "t"], cwd=repo, check=True)
         (repo / ".gitignore").write_text(".git_credentials.json\n", encoding="utf-8")
 
-        mem = Memory(str(repo), create=True)
+        mem = Memory(str(repo), create=True, embedder=None)
         mem.capture("USER", "remember: Alice likes coffee")
         mem.commit("selftest")
 
@@ -770,7 +1100,7 @@ def selftest():
         assert INDEX_FILE in subprocess.run(["git", "ls-files"], cwd=repo,
                                             capture_output=True, text=True).stdout.split()
         (repo / ".gitignore").write_text(".git_credentials.json\n", encoding="utf-8")
-        Memory(str(repo)).commit("after migration")
+        Memory(str(repo), embedder=None).commit("after migration")
         tracked = subprocess.run(["git", "ls-files"], cwd=repo,
                                  capture_output=True, text=True).stdout.split()
         assert INDEX_FILE not in tracked, "reopening must untrack an already-committed index"

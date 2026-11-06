@@ -6,12 +6,17 @@
 """
 viral-git-agent-memory — Consolidation Hook
 
-Same pattern as mempal-ollama-save.py but writes to git+markdown instead of SQLite.
-Writes/updates markdown memory files, rebuilds indexes, and commits to git.
+Extracts durable facts from a conversation, reconciles them against the existing
+memories (A.U.D.N.), writes the markdown files, regenerates the "## Index" blocks in
+SOUL.md / USER.md and commits (and pushes) to git.
 
-Trigger: every 30 messages, /bye, or 10 min inactivity.
+Trigger: every 30 messages, /bye, or 10 min inactivity (the server spawns this as a
+background process), or run it by hand on a saved transcript.
 LLM: OpenAI-compatible (OpenAI, DeepSeek, etc.), Anthropic (Claude), or Ollama — user picks via env vars.
-Output: markdown files in a memory repo.
+Output: markdown files in a memory repo. A failed LLM call raises, exits non-zero and
+KEEPS the transcript so the run can be retried.
+
+POSIX only (the repo lock is fcntl.flock). Stdlib only.
 
 Configuration (env vars):
     MEMORY_LLM_PROVIDER  = "openai" | "anthropic" | "ollama"  (required)
@@ -37,19 +42,34 @@ Usage:
     # Test with a fake transcript:
     python memory_hook.py --test /path/to/repo
 """
-import fcntl
 import json
 import os
 import re
-import subprocess
 import sys
-import tempfile
-import urllib.request
 import urllib.error
-from contextlib import contextmanager
+import urllib.request
 from datetime import date
 from pathlib import Path
 from textwrap import dedent
+
+import gitmem as gm
+import gitops
+from gitmem import Memory
+
+# Re-exported: tests and api_server use these names via memory_hook.
+from gitops import (  # noqa: F401
+    CREDENTIALS_FILE,
+    GIT_CMD_TIMEOUT,
+    GIT_PUSH_TIMEOUT,
+    GITHUB_REMOTE,
+    git_auth,
+    git_credentials_path,
+    load_git_credentials,
+    push_to_github,
+    save_git_credentials,
+)
+
+TEMPLATE_DIR = Path(__file__).parent / "template"
 
 # --- LLM Provider Config ---
 LLM_PROVIDER = os.environ.get("MEMORY_LLM_PROVIDER", "").lower()
@@ -151,9 +171,11 @@ AUDN_PROMPT = dedent("""\
     __NEW_FACTS__
 
     Output ONLY valid JSON with this structure:
-    {"decisions": [{"action": "ADD", "slug": "example-slug", "fact": "the fact", "episode": "when learned", "target_slug": ""}]}
+    {"decisions": [{"action": "ADD", "slug": "example-slug", "fact": "the fact", "episode": "when learned", "pinned": false, "target_slug": ""}]}
 
-    Each decision object has: action (ADD|UPDATE|DELETE|NONE), slug, fact, episode, target_slug (for UPDATE/DELETE/NONE).
+    Each decision object has: action (ADD|UPDATE|DELETE|NONE), slug, fact, episode,
+    pinned (true only for safety-critical or identity-defining facts), target_slug
+    (for UPDATE/DELETE/NONE). Existing memories are listed as "- **slug**: fact text".
 """)
 
 
@@ -180,144 +202,107 @@ def _log(msg: str):
     print(msg, file=sys.stderr, flush=True)
 
 
-def call_openai(system_prompt: str, user_content: str, creds: dict | None = None) -> str:
-    """Call any OpenAI-compatible API (OpenAI, DeepSeek, Together, Groq, etc.).
+class LLMError(RuntimeError):
+    """The LLM call failed or returned something unusable. Never swallowed: a failed
+    consolidation must not look like "no facts found" (the transcript would be lost)."""
 
-    `creds` overrides the module-level env config for one call: {"api_key", "api_url",
-    "model"}. That is what lets one process serve many users on their own keys instead
-    of a single tenant configured at startup.
 
-    `model` may be a LIST, which OpenRouter reads as a fallback chain in priority
-    order ("models"). Anything else gets the single "model" field every other
-    OpenAI-compatible provider expects.
-    """
-    creds = creds or {}
-    api_key = creds.get("api_key") or OPENAI_API_KEY
-    api_url = (creds.get("api_url") or OPENAI_API_URL).rstrip("/")
-    model = creds.get("model") or OPENAI_MODEL
-    if not api_key:
-        _log("[error] no API key — neither creds nor OPENAI_API_KEY")
-        return ""
-
-    which = {"models": list(model)} if isinstance(model, (list, tuple)) else {"model": model}
-    payload = json.dumps({
-        **which,
-        "temperature": 0.2,
-        "max_tokens": 2048,
-        "response_format": {"type": "json_object"},
-        "messages": [
-            {"role": "system", "content": system_prompt},
-            {"role": "user", "content": user_content},
-        ],
-    }).encode()
-
-    url = f"{api_url}/v1/chat/completions"
+def _post_json(url: str, payload: dict, headers: dict, timeout: int, label: str) -> dict:
     req = urllib.request.Request(
         url,
-        data=payload,
-        headers={
-            "Content-Type": "application/json",
-            "Authorization": f"Bearer {api_key}",
-        },
+        data=json.dumps(payload).encode(),
+        headers={"Content-Type": "application/json", **headers},
         method="POST",
     )
     try:
-        with urllib.request.urlopen(req, timeout=120) as resp:
-            result = json.loads(resp.read())
-            return result["choices"][0]["message"]["content"].strip()
+        with urllib.request.urlopen(req, timeout=timeout) as resp:
+            return json.loads(resp.read())
     except Exception as e:
-        _log(f"[openai error] {e}")
-        return ""
+        raise LLMError(f"{label}: {e}") from e
+
+
+def call_openai(system_prompt: str, user_content: str) -> str:
+    """Call any OpenAI-compatible API (OpenAI, DeepSeek, Together, Groq, etc.)."""
+    if not OPENAI_API_KEY:
+        raise LLMError("OPENAI_API_KEY not set")
+    result = _post_json(
+        f"{OPENAI_API_URL}/v1/chat/completions",
+        {
+            "model": OPENAI_MODEL,
+            "temperature": 0.2,
+            "max_tokens": 2048,
+            "response_format": {"type": "json_object"},
+            "messages": [
+                {"role": "system", "content": system_prompt},
+                {"role": "user", "content": user_content},
+            ],
+        },
+        {"Authorization": f"Bearer {OPENAI_API_KEY}"},
+        120, "openai",
+    )
+    try:
+        return result["choices"][0]["message"]["content"].strip()
+    except (KeyError, IndexError, TypeError, AttributeError) as e:
+        raise LLMError(f"openai: unexpected response shape: {e!r}") from e
 
 
 def call_anthropic(system_prompt: str, user_content: str) -> str:
     """Call Anthropic Messages API (Claude) via urllib — no SDK needed."""
     if not ANTHROPIC_API_KEY:
-        _log("[error] ANTHROPIC_API_KEY not set")
-        return ""
-
-    payload = json.dumps({
-        "model": ANTHROPIC_MODEL,
-        "max_tokens": 2048,
-        "temperature": 0.2,
-        "system": system_prompt,
-        "messages": [
-            {"role": "user", "content": user_content},
-            {"role": "assistant", "content": "{"},
-        ],
-    }).encode()
-
-    url = f"{ANTHROPIC_API_URL}/v1/messages"
-    req = urllib.request.Request(
-        url,
-        data=payload,
-        headers={
-            "Content-Type": "application/json",
-            "x-api-key": ANTHROPIC_API_KEY,
-            "anthropic-version": "2023-06-01",
+        raise LLMError("ANTHROPIC_API_KEY not set")
+    result = _post_json(
+        f"{ANTHROPIC_API_URL}/v1/messages",
+        {
+            "model": ANTHROPIC_MODEL,
+            "max_tokens": 2048,
+            "temperature": 0.2,
+            "system": system_prompt,
+            "messages": [
+                {"role": "user", "content": user_content},
+                {"role": "assistant", "content": "{"},
+            ],
         },
-        method="POST",
+        {"x-api-key": ANTHROPIC_API_KEY, "anthropic-version": "2023-06-01"},
+        120, "anthropic",
     )
     try:
-        with urllib.request.urlopen(req, timeout=120) as resp:
-            result = json.loads(resp.read())
-            text = result["content"][0]["text"].strip()
-            # Prepend the "{" we used as prefill
-            return "{" + text
-    except Exception as e:
-        _log(f"[anthropic error] {e}")
-        return ""
+        return "{" + result["content"][0]["text"].strip()  # prepend the "{" prefill
+    except (KeyError, IndexError, TypeError, AttributeError) as e:
+        raise LLMError(f"anthropic: unexpected response shape: {e!r}") from e
 
 
 def call_ollama(system_prompt: str, user_content: str) -> str:
     """Call Ollama API (local or tunneled) via urllib — no SDK needed."""
-    payload = json.dumps({
-        "model": OLLAMA_MODEL,
-        "messages": [
-            {"role": "system", "content": system_prompt},
-            {"role": "user", "content": user_content},
-        ],
-        "stream": False,
-        "think": False,
-        "options": {"temperature": 0.2, "num_predict": 2048},
-        "format": "json",
-    }).encode()
-
-    req = urllib.request.Request(
+    result = _post_json(
         f"{OLLAMA_URL}/api/chat",
-        data=payload,
-        headers={"Content-Type": "application/json"},
-        method="POST",
+        {
+            "model": OLLAMA_MODEL,
+            "messages": [
+                {"role": "system", "content": system_prompt},
+                {"role": "user", "content": user_content},
+            ],
+            "stream": False,
+            "think": False,
+            "options": {"temperature": 0.2, "num_predict": 2048},
+            "format": "json",
+        },
+        {}, 180, "ollama",
     )
     try:
-        with urllib.request.urlopen(req, timeout=180) as resp:
-            result = json.loads(resp.read())
-            return result.get("message", {}).get("content", "").strip()
-    except Exception as e:
-        _log(f"[ollama error] {e}")
-        return ""
+        return result["message"]["content"].strip()
+    except (KeyError, TypeError, AttributeError) as e:
+        raise LLMError(f"ollama: unexpected response shape: {e!r}") from e
 
 
-def call_llm(system_prompt: str, user_content: str, creds: dict | None = None) -> str:
-    """Dispatch to the configured LLM provider.
-
-    A per-user `creds` always goes to the OpenAI-compatible path — OpenRouter, which
-    is what users bring, speaks that dialect — and bypasses MEMORY_LLM_PROVIDER, so a
-    multi-tenant server does not need the env config set at all.
-    """
-    if creds and creds.get("api_key"):
-        return call_openai(system_prompt, user_content, creds)
-    if not LLM_PROVIDER:
-        _log("[error] MEMORY_LLM_PROVIDER not set — must be 'openai', 'anthropic', or 'ollama'")
-        sys.exit(1)
+def call_llm(system_prompt: str, user_content: str) -> str:
+    """Dispatch to the configured LLM provider. Raises LLMError on any failure."""
     if LLM_PROVIDER == "ollama":
         return call_ollama(system_prompt, user_content)
     if LLM_PROVIDER == "openai":
         return call_openai(system_prompt, user_content)
     if LLM_PROVIDER == "anthropic":
         return call_anthropic(system_prompt, user_content)
-    _log(f"[error] unknown MEMORY_LLM_PROVIDER={LLM_PROVIDER!r} — must be 'openai', 'anthropic', or 'ollama'")
-    sys.exit(1)
+    raise LLMError(f"MEMORY_LLM_PROVIDER={LLM_PROVIDER!r} — must be 'openai', 'anthropic', or 'ollama'")
 
 
 def parse_json(raw: str) -> dict:
@@ -328,13 +313,23 @@ def parse_json(raw: str) -> dict:
     if start == -1 or end == 0:
         return {}
     try:
-        return json.loads(raw[start:end])
+        data = json.loads(raw[start:end])
     except json.JSONDecodeError:
         return {}
+    return data if isinstance(data, dict) else {}
 
 
-def read_transcript(transcript_path: str, max_messages: int = 60) -> str:
-    """Read a Claude Code JSONL transcript, return last N messages as text."""
+def _items(raw: str, key: str) -> list:
+    """The list under `key` in an LLM answer; raises LLMError if there is none, so an
+    unusable answer is a failure (transcript kept) and not a silent "nothing found"."""
+    items = parse_json(raw).get(key)
+    if not isinstance(items, list):
+        raise LLMError(f"LLM answer has no '{key}' list: {raw[:120]!r}")
+    return items
+
+
+def read_transcript(transcript_path: str, max_messages: int = 200, max_chars: int = 4000) -> str:
+    """Read a JSONL transcript ({"message": {"role", "content"}} per line) as text."""
     path = Path(transcript_path)
     if not path.is_file():
         return ""
@@ -343,27 +338,23 @@ def read_transcript(transcript_path: str, max_messages: int = 60) -> str:
         with open(path, encoding="utf-8", errors="replace") as f:
             for line in f:
                 try:
-                    entry = json.loads(line)
-                    msg = entry.get("message", {})
-                    if not isinstance(msg, dict):
-                        continue
-                    role = msg.get("role", "")
-                    if role not in ("user", "assistant"):
-                        continue
-                    content = msg.get("content", "")
-                    text = (
-                        " ".join(
-                            b.get("text", "")
-                            for b in content
-                            if isinstance(b, dict) and b.get("type") == "text"
-                        )
-                        if isinstance(content, list)
-                        else str(content)
-                    ).strip()
-                    if text and "<command-message>" not in text:
-                        lines.append(f"{role.upper()}: {text[:500]}")
+                    msg = json.loads(line).get("message", {})
                 except (json.JSONDecodeError, AttributeError):
-                    pass
+                    continue
+                if not isinstance(msg, dict) or msg.get("role") not in ("user", "assistant"):
+                    continue
+                content = msg.get("content", "")
+                text = (
+                    " ".join(
+                        b.get("text", "")
+                        for b in content
+                        if isinstance(b, dict) and b.get("type") == "text"
+                    )
+                    if isinstance(content, list)
+                    else str(content)
+                ).strip()
+                if text:
+                    lines.append(f"{msg['role'].upper()}: {text[:max_chars]}")
     except OSError:
         return ""
     return "\n".join(lines[-max_messages:])
@@ -373,575 +364,208 @@ def read_transcript(transcript_path: str, max_messages: int = 60) -> str:
 
 
 def init_repo(repo_path: str, user_id: str):
-    """Initialize a user's memory repo from template/ if available, else bare skeleton.
-    Git init/commit is handled by mcp-server-git — this only sets up the file structure."""
-    import shutil
+    """Make sure a user's repo exists and has the memory dirs.
 
+    A missing repo is created atomically from template/ (gitops.init_user_repo, also
+    what the server uses) with the user ID stamped into USER.md and a first commit.
+    """
     repo = Path(repo_path)
-    template_dir = Path(__file__).parent / "template"
+    gitops.init_user_repo(repo, user_id, TEMPLATE_DIR)  # no-op if it exists
+    repo.mkdir(parents=True, exist_ok=True)
+    for d in ("USER_memory", "SOUL_memory"):
+        (repo / d).mkdir(exist_ok=True)
 
-    if not repo.exists() and template_dir.exists():
-        # Copy full template (CLAUDE.md, SOUL.md, USER.md, dirs)
-        shutil.copytree(template_dir, repo)
-        # Stamp user ID
-        user_md = repo / "USER.md"
-        user_md.write_text(
-            user_md.read_text(encoding="utf-8").replace("User ID: no_one", f"User ID: {user_id}"),
-            encoding="utf-8",
-        )
-    else:
-        repo.mkdir(parents=True, exist_ok=True)
-
-    # Ensure dirs exist (template has them, but just in case)
-    (repo / "USER_memory").mkdir(exist_ok=True)
-    (repo / "SOUL_memory").mkdir(exist_ok=True)
-
-    # Migration: rename old files to nanobot-compatible names
-    old_soul = repo / "character.md"
-    old_user = repo / "user.md"
-    if old_soul.exists() and not (repo / "SOUL.md").exists():
-        old_soul.rename(repo / "SOUL.md")
-    if old_user.exists() and not (repo / "USER.md").exists():
-        old_user.rename(repo / "USER.md")
+    # Migration: rename old files to current names
+    for old, new in (("character.md", "SOUL.md"), ("user.md", "USER.md")):
+        if (repo / old).exists() and not (repo / new).exists():
+            (repo / old).rename(repo / new)
 
 
-def load_existing_memories(repo_path: str, memory_type: str) -> list[dict]:
-    """Load existing memory files from USER_memory/ or SOUL_memory/."""
-    mem_dir = Path(repo_path) / memory_type
-    if not mem_dir.is_dir():
-        return []
+_safe_slug = gm.safe_slug
 
-    memories = []
-    for f in sorted(mem_dir.glob("*.md"), key=lambda p: p.stat().st_mtime, reverse=True):
-        content = f.read_text(encoding="utf-8")
-        memories.append({
-            "slug": f.stem,
-            "content": content,
-        })
-    return memories
+
+def _kind(memory_type: str) -> str:
+    """"USER_memory" (a directory name) or "USER" -> "USER"; validated by gitmem."""
+    return gm.check_type(memory_type.removesuffix("_memory"))
+
+
+def relevant_memories(repo_path: str, kind: str, facts: list[dict],
+                      everything_up_to: int = 30, per_fact: int = 5) -> list[dict]:
+    """The existing memories the A.U.D.N. step should see, as [{"slug", "fact"}].
+
+    A small store goes in whole. A big one is narrowed to what is relevant to the new
+    facts (full-text, plus embeddings when configured) topped up with the popular
+    ones — not the 20 newest files, which re-added old duplicates.
+    """
+    mem = Memory(repo_path)
+    try:
+        total = mem.count(kind)
+        if total <= everything_up_to:
+            hits = mem.top(kind, max(total, 1))
+        else:
+            hits = mem.top(kind, 10)
+            for f in facts:
+                hits += mem.search(f"{f['slug'].replace('-', ' ')} {f['fact']}", kind, per_fact)
+    finally:
+        mem.close()
+    seen, out = set(), []
+    for h in hits:
+        if h["slug"] not in seen:
+            seen.add(h["slug"])
+            out.append({"slug": h["slug"], "fact": h["fact"]})
+    return out
 
 
 def format_existing_for_prompt(memories: list[dict]) -> str:
-    """Format existing memories for the A.U.D.N. prompt."""
+    """Existing memories for the A.U.D.N. prompt: slug + Fact text only, no file headers."""
     if not memories:
         return "(no existing memories)"
-    parts = []
-    for m in memories[:20]:  # cap at 20 for context window
-        parts.append(f"- **{m['slug']}**: {m['content'][:200]}")
-    return "\n".join(parts)
+    return "\n".join(f"- **{m['slug']}**: {' '.join(m['fact'].split())[:300]}" for m in memories)
 
 
-def _safe_slug(slug: str) -> str:
-    """Sanitize a slug to prevent path traversal from LLM-generated values."""
-    # Strip path separators and dangerous characters
-    safe = re.sub(r'[^a-zA-Z0-9_\-]', '-', slug)
-    # Remove leading dots/dashes, collapse runs
-    safe = re.sub(r'^[\-\.]+', '', safe)
-    safe = re.sub(r'-{2,}', '-', safe)
-    if not safe:
-        safe = "unnamed"
-    return safe[:80]
+def build_audn_prompt(existing: str, new_facts: str) -> str:
+    """Fill AUDN_PROMPT in ONE pass: sequential .replace() would substitute a
+    placeholder that happens to appear inside the memory text itself."""
+    values = {"__EXISTING__": existing, "__NEW_FACTS__": new_facts}
+    return re.sub(r"__EXISTING__|__NEW_FACTS__", lambda m: values[m.group()], AUDN_PROMPT)
 
 
 def write_memory_file(repo_path: str, memory_type: str, slug: str, fact: str, episode: str,
-                      seen_slugs: set | None = None, pinned: bool = False):
+                      seen_slugs: set | None = None, pinned: bool = False) -> str:
     """Create a new memory .md file. If slug collides (on disk or in batch), suffix it."""
-    mem_dir = Path(repo_path) / memory_type
-    mem_dir.mkdir(exist_ok=True)
-    slug = _safe_slug(slug)
-
-    today = date.today().strftime("%d.%m.%y")
-
-    # Auto-detect pinning from content if not explicitly set
-    if not pinned:
-        pinned = should_pin(fact)
-
-    # Resolve collisions: on-disk or intra-batch
-    base_slug = slug
-    counter = 2
-    while True:
-        filepath = mem_dir / f"{slug}.md"
-        in_batch = seen_slugs is not None and slug in seen_slugs
-        if not filepath.exists() and not in_batch:
-            break
-        slug = f"{base_slug}-{counter}"
-        counter += 1
-        if counter > 50:  # safety valve
-            slug = f"{base_slug}-{date.today().strftime('%Y%m%d%H%M%S')}"
-            break
-    if slug != base_slug:
-        _log(f"[write] slug collision: {base_slug} → {slug}")
-
-    if seen_slugs is not None:
-        seen_slugs.add(slug)
-
-    filepath = mem_dir / f"{slug}.md"
-    content = f"# {slug.replace('-', ' ').title()}\n\n"
-    content += f"## Fact\n{fact}\n\n"
-    if pinned:
-        content += f"## Pinned\ncritical\n\n"
-    # Match gitmem.render(): no empty Episode section — it only adds noise to
-    # the FTS index and the two writers should stay byte-compatible.
-    if episode:
-        content += f"## Episode\n{episode}\n\n"
-    content += f"## Access log\nused, {today}\n"
-    filepath.write_text(content, encoding="utf-8")
-
-
-# "## Access log" must be located as a real header line, not a substring — the
-# same rule _is_pinned got in pass 2 (#22). A fact or episode that merely
-# mentions "## Access log" mid-text used to move where stamps were counted and
-# inserted, silently losing uses from the popularity ranking.
-_ACCESS_LOG_RE = re.compile(r"^## Access log[ \t]*$", re.M)
-
-
-def _find_access_log(content: str) -> int:
-    """Offset of the Access log header line, or -1."""
-    m = _ACCESS_LOG_RE.search(content)
-    return m.start() if m else -1
-
-
-def _stamp_used(content: str, today: str) -> str:
-    """Append a `used,` stamp INSIDE the ## Access log section.
-
-    Stamps used to be appended at end of file — after a ## Contradicted section
-    when one existed, where neither memory_hook's own _count_used_stamps nor
-    gitmem's parse() ever counts them. Popularity ranking silently lost those
-    uses.
-    """
-    log_idx = _find_access_log(content)
-    if log_idx == -1:
-        return content.rstrip() + "\n\n## Access log\nused, " + today + "\n"
-    next_section = re.search(r"\n## (?!Access log)", content[log_idx:])
-    if next_section:
-        split = log_idx + next_section.start()
-        log_section, tail = content[:split], content[split:]
-        return log_section.rstrip() + f"\nused, {today}\n" + tail
-    return content.rstrip() + f"\nused, {today}\n"
+    return gm.create(repo_path, _kind(memory_type), slug, fact, episode,
+                     pinned or should_pin(fact), seen_slugs)
 
 
 def update_memory_file(repo_path: str, memory_type: str, slug: str, fact: str, episode: str):
-    """Update an existing memory file with new info.
-
-    Rewrites fact + episode while preserving the sections that carry state:
-    the access log (popularity ranking) and `## Pinned`. The pin used to be
-    silently dropped here — an allergy or other safety-critical memory lost its
-    always-load status the first time an UPDATE decision refined it.
-
-    `## Contradicted` is deliberately cleared: an UPDATE means the fact was just
-    refined with fresh information, so it is valid again. Keeping the marker
-    made a corrected memory keep sinking, and diverged from gitmem.write(),
-    which never re-emits it.
-    """
+    """Update an existing memory: new fact + episode, access log and pin preserved,
+    a use stamped, `## Contradicted` cleared (the fact was just refined, so it is valid
+    again). A missing target is created as a new memory."""
     slug = _safe_slug(slug)
-    mem_dir = Path(repo_path) / memory_type
-    filepath = mem_dir / f"{slug}.md"
-    today = date.today().strftime("%d.%m.%y")
-
-    if filepath.exists():
-        content = filepath.read_text(encoding="utf-8")
-        # Preserve the access log and any unknown trailing sections, minus
-        # the Contradicted marker (see docstring).
-        log_idx = _find_access_log(content)
-        access_log = content[log_idx:] if log_idx != -1 else "## Access log\n"
-        access_log = re.sub(r"\n*^## Contradicted[ \t]*\n(?:(?!## ).*(?:\n|$))*",
-                            "\n", access_log, flags=re.M)
-        pinned = _is_pinned(content)
-
-        new_content = f"# {slug.replace('-', ' ').title()}\n\n"
-        new_content += f"## Fact\n{fact}\n\n"
-        if pinned:
-            new_content += "## Pinned\ncritical\n\n"
-        if episode:
-            new_content += f"## Episode\n{episode}\n\n"
-        new_content += access_log.rstrip() + "\n"
-        new_content = _stamp_used(new_content, today)
-        filepath.write_text(new_content, encoding="utf-8")
-    else:
+    if not gm._file(repo_path, _kind(memory_type), slug).exists():
         _log(f"[warn] UPDATE target '{slug}' not found on disk — creating as new file")
         write_memory_file(repo_path, memory_type, slug, fact, episode)
+        return
+    gm.upsert(repo_path, _kind(memory_type), slug, fact, episode, stamp=True)
 
 
 def mark_contradicted(repo_path: str, memory_type: str, slug: str):
-    """Mark a memory as contradicted (it'll sink via recency)."""
-    slug = _safe_slug(slug)
-    mem_dir = Path(repo_path) / memory_type
-    filepath = mem_dir / f"{slug}.md"
-    today = date.today().strftime("%d.%m.%y")
-
-    if not filepath.exists():
+    """Mark a memory as contradicted: it stays on disk but drops out of recall."""
+    if not gm.mark_contradicted(repo_path, _kind(memory_type), slug):
         _log(f"[warn] DELETE target '{slug}' not found on disk — skipping contradiction mark")
-        return
-
-    content = filepath.read_text(encoding="utf-8")
-    if "## Contradicted" not in content:
-        content += f"\n## Contradicted\nMarked contradicted on {today}\n"
-        filepath.write_text(content, encoding="utf-8")
 
 
 def _count_used_stamps(content: str) -> int:
-    """Count 'used,' lines only in the Access log section, not in fact/episode text."""
-    log_idx = _find_access_log(content)
-    if log_idx == -1:
-        return 0
-    log_section = content[log_idx:]
-    # Stop at next section if any
-    next_section = re.search(r"\n## (?!Access log)", log_section)
-    if next_section:
-        log_section = log_section[:next_section.start()]
-    return sum(1 for line in log_section.splitlines() if line.strip().startswith("used,"))
+    """Count 'used,' lines in the Access log section only, not in fact/episode text."""
+    return gm.parse(content)["used"]
 
 
-def _is_pinned(content: str) -> bool:
-    """Check if a memory file has a ## Pinned section header.
-
-    Matches only a real header line, like gitmem.parse() does — a fact or
-    episode that merely mentions "## Pinned" mid-line must not pin the file.
-    """
-    return re.search(r"^## Pinned[ \t]*$", content, re.M) is not None
-
-
-def _use_count_and_recency(filepath: Path) -> tuple[int, int, float]:
-    """Return (pinned, use_count, last_mod_time) for sorting: pinned first, then most used, recency as tiebreaker."""
-    content = filepath.read_text(encoding="utf-8")
-    count = _count_used_stamps(content)
-    pinned = 1 if _is_pinned(content) else 0
-    return (pinned, count, filepath.stat().st_mtime)
-
-
-# --- GitHub mirror ---
-#
-# The remote for the user's own GitHub mirror. Deliberately NOT "origin": origin is
-# wherever the operator stores memory. Overwriting it means the first user who
-# connects GitHub silently stops saving to that store.
-GITHUB_REMOTE = "github"
-
-# Per-user GitHub credentials. Lives inside the repo but is gitignored and 0600, so it
-# is never committed and never pushed. The token has to survive a server restart —
-# without it "every consolidation auto-pushes" is not possible at all.
-CREDENTIALS_FILE = ".git_credentials.json"
-
-
-def git_credentials_path(repo: Path) -> Path:
-    return repo / CREDENTIALS_FILE
-
-
-def load_git_credentials(repo: Path) -> dict:
-    try:
-        return json.loads(git_credentials_path(repo).read_text(encoding="utf-8"))
-    except (json.JSONDecodeError, OSError):
-        return {}
-
-
-def save_git_credentials(repo: Path, creds: dict):
-    """Write credentials 0600 and make sure git never picks the file up."""
-    path = git_credentials_path(repo)
-    # Create with 0600 from the start — writing then chmod leaves a window where the
-    # token is world-readable.
-    fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
-    with os.fdopen(fd, "w", encoding="utf-8") as f:
-        json.dump(creds, f, indent=2)
-    os.chmod(path, 0o600)  # pre-existing file keeps its old mode through O_CREAT
-
-    gitignore = repo / ".gitignore"
-    content = gitignore.read_text(encoding="utf-8") if gitignore.exists() else ""
-    if CREDENTIALS_FILE not in content:
-        with open(gitignore, "a", encoding="utf-8") as f:
-            f.write(("\n" if content and not content.endswith("\n") else "") + CREDENTIALS_FILE + "\n")
-
-
-@contextmanager
-def git_auth(token: str):
-    """Yield an env that authenticates git without the token ever being written down.
-
-    The token goes in neither the remote URL (which lands in .git/config in plaintext
-    and is echoed back in git's own error messages) nor argv (visible in `ps`). It is
-    passed to a throwaway GIT_ASKPASS helper through the environment instead.
-    """
-    fd, helper = tempfile.mkstemp(prefix="git-askpass-")
-    try:
-        os.write(fd, b'#!/bin/sh\nprintf %s "$GIT_ACCESS_TOKEN"\n')
-        os.close(fd)
-        os.chmod(helper, 0o700)
-        yield {
-            **os.environ,
-            "GIT_ASKPASS": helper,
-            "GIT_ACCESS_TOKEN": token,
-            "GIT_TERMINAL_PROMPT": "0",
-            "GIT_AUTHOR_NAME": "memory-server",
-            "GIT_AUTHOR_EMAIL": "server@viral-git-agent-memory",
-            "GIT_COMMITTER_NAME": "memory-server",
-            "GIT_COMMITTER_EMAIL": "server@viral-git-agent-memory",
-        }
-    finally:
-        os.unlink(helper)
-
-
-# Hard ceilings for git subprocesses. A stalled network push used to block the
-# consolidation worker forever — holding the per-user flock, so every later
-# consolidation for that user queued behind it and the transcript piled up.
-GIT_CMD_TIMEOUT = int(os.environ.get("GIT_CMD_TIMEOUT", "60"))
-GIT_PUSH_TIMEOUT = int(os.environ.get("GIT_PUSH_TIMEOUT", "120"))
-
-
-def push_to_github(repo: Path, token: str | None = None) -> bool:
-    """Mirror the repo to the user's GitHub. Returns False if GitHub isn't connected.
-
-    Separate from git_commit's own push, which goes to the operator's memory store.
-    `token` defaults to the one saved by /v1/git/setup.
-    """
-    repo = Path(repo)
-    token = token or load_git_credentials(repo).get("token", "")
-    if not token:
-        return False
-    try:
-        remotes = subprocess.run(["git", "remote"], cwd=repo, capture_output=True,
-                                 text=True, timeout=GIT_CMD_TIMEOUT)
-        if GITHUB_REMOTE not in remotes.stdout.split():
-            return False
-        branch = subprocess.run(
-            ["git", "branch", "--show-current"], cwd=repo, capture_output=True,
-            text=True, timeout=GIT_CMD_TIMEOUT,
-        )
-        with git_auth(token) as env:
-            push = subprocess.run(
-                ["git", "push", GITHUB_REMOTE, branch.stdout.strip() or "main"],
-                cwd=repo, capture_output=True, text=True, env=env,
-                timeout=GIT_PUSH_TIMEOUT,
-            )
-    except subprocess.TimeoutExpired:
-        _log("[github] mirror push timed out — giving up this round")
-        return False
-    if push.returncode != 0:
-        _log(f"[github] mirror push failed: {push.stderr.strip()[:200]}")
-    else:
-        _log("[github] mirrored")
-    return push.returncode == 0
+# --- Git ---
 
 
 def git_commit(repo_path: str):
-    """Git add + commit after consolidation. Safe to call even if nothing changed."""
-    repo = Path(repo_path)
-    if not (repo / ".git").is_dir():
-        _log("[git] not a git repo, skipping commit")
-        return
-
-    env = {
-        **os.environ,
-        # Never let an unauthenticated remote drop git into an interactive
-        # credential prompt — under a daemon that hangs the worker, not fails it.
-        "GIT_TERMINAL_PROMPT": "0",
-        "GIT_AUTHOR_NAME": "memory-hook",
-        "GIT_AUTHOR_EMAIL": "hook@viral-git-agent-memory",
-        "GIT_COMMITTER_NAME": "memory-hook",
-        "GIT_COMMITTER_EMAIL": "hook@viral-git-agent-memory",
-    }
-    try:
-        subprocess.run(["git", "add", "-A"], cwd=repo, capture_output=True, env=env,
-                       timeout=GIT_CMD_TIMEOUT)
-        result = subprocess.run(
-            ["git", "commit", "-m", f"checkpoint {date.today().strftime('%d.%m.%y')}"],
-            cwd=repo, capture_output=True, text=True, env=env, timeout=GIT_CMD_TIMEOUT,
-        )
-    except subprocess.TimeoutExpired:
-        _log("[git] add/commit timed out — skipping this round")
-        return
-    if result.returncode == 0:
-        _log(f"[git] committed: {result.stdout.strip().splitlines()[0]}")
-        # Push if remote exists
-        has_remote = subprocess.run(
-            ["git", "remote"], cwd=repo, capture_output=True, text=True,
-            timeout=GIT_CMD_TIMEOUT,
-        )
-        if has_remote.stdout.strip():
-            try:
-                push = subprocess.run(
-                    ["git", "push"], cwd=repo, capture_output=True, text=True, env=env,
-                    timeout=GIT_PUSH_TIMEOUT,
-                )
-            except subprocess.TimeoutExpired:
-                _log("[git] push timed out — will retry on the next consolidation")
-            else:
-                if push.returncode == 0:
-                    _log("[git] pushed")
-                else:
-                    # Sanitize stderr to avoid logging tokens from remote URL
-                    err_msg = re.sub(r'https://[^@]+@', 'https://***@', push.stderr.strip()[:100])
-                    _log(f"[git] push failed: {err_msg}")
-    else:
-        # "nothing to commit" goes to STDOUT, not stderr — checking stderr alone
-        # reported every no-op consolidation as a hard failure.
-        output = (result.stdout + result.stderr).strip()
-        if "nothing to commit" in output or "working tree clean" in output:
-            _log("[git] nothing to commit")
-        else:
-            # Real error: disk full, identity misconfigured, index locked, etc.
-            _log(f"[git] COMMIT FAILED (rc={result.returncode}): {output[:200]}")
-
-    # Mirror to the user's own GitHub, if they connected one. Runs even when this
-    # consolidation committed nothing: that is what re-syncs a mirror left behind by
-    # an earlier push failure, and it costs one "Everything up-to-date" otherwise.
-    push_to_github(repo)
+    """Git add + commit (+ push) after consolidation. Safe to call even if nothing changed."""
+    gitops.git_commit(repo_path, log=_log)
 
 
 # --- Main Consolidation Flow ---
 
 
-class _UserLock:
-    """Per-user file lock to prevent concurrent consolidations racing on .md files and git."""
-
-    def __init__(self, repo_path: str):
-        self._lockfile = Path(repo_path) / ".consolidation.lock"
-        self._fd = None
-
-    def __enter__(self):
-        self._fd = open(self._lockfile, "w")
-        try:
-            fcntl.flock(self._fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
-        except OSError:
-            _log("[lock] another consolidation is running for this user — waiting...")
-            fcntl.flock(self._fd, fcntl.LOCK_EX)  # block until available
-        return self
-
-    def __exit__(self, *exc):
-        if self._fd:
-            fcntl.flock(self._fd, fcntl.LOCK_UN)
-            self._fd.close()
-        return False
+def _fact(item, today: str) -> dict | None:
+    """Validate one LLM-produced fact/decision object; None (logged) if unusable."""
+    if not isinstance(item, dict):
+        _log(f"[skip] not an object: {str(item)[:60]!r}")
+        return None
+    fact = item.get("fact")
+    if not isinstance(fact, str) or not gm.clean_text(fact):
+        return {**item, "fact": ""}  # only ADD/UPDATE need a fact; NONE/DELETE do not
+    slug = item.get("slug")
+    slug = slug if isinstance(slug, str) and slug.strip() else gm.slug_from(fact)
+    episode = item.get("episode")
+    return {
+        **item,
+        "slug": slug,
+        "fact": fact,
+        "episode": episode if isinstance(episode, str) and episode.strip() else f"Session {today}",
+        "pinned": item.get("pinned") is True,
+    }
 
 
-def consolidate(repo_path: str, transcript: str, creds: dict | None = None):
+def _apply(repo_path: str, kind: str, label: str, facts: list, today: str):
+    """The A.U.D.N. step for one memory kind (USER or SOUL)."""
+    facts = [f for f in (_fact(i, today) for i in facts) if f and f["fact"]]
+    if not facts:
+        return
+    existing = relevant_memories(repo_path, kind, facts)
+    if existing:
+        raw = call_llm(
+            build_audn_prompt(format_existing_for_prompt(existing), json.dumps(
+                [{k: f[k] for k in ("slug", "fact", "episode", "pinned")} for f in facts], indent=2)),
+            "Decide what to do with each new fact.",
+        )
+        decisions = [d for d in (_fact(i, today) for i in _items(raw, "decisions")) if d]
+    else:
+        _log(f"[{label}] empty memory — adding all facts directly")
+        decisions = [{**f, "action": "ADD"} for f in facts]
+
+    seen_slugs: set[str] = set()
+    for d in decisions:
+        action = str(d.get("action", "")).upper()
+        target = d.get("target_slug")
+        target = _safe_slug(target) if isinstance(target, str) and target.strip() else ""
+        if action == "ADD" and d["fact"]:
+            slug = gm.create(repo_path, kind, d["slug"], d["fact"], d["episode"],
+                             d["pinned"] or should_pin(d["fact"]), seen_slugs)
+            _log(f"[{label}] ADD: {slug}")
+        elif action == "UPDATE" and target and d["fact"]:
+            update_memory_file(repo_path, kind, target, d["fact"], d["episode"])
+            _log(f"[{label}] UPDATE: {target}")
+        elif action == "DELETE" and target:
+            mark_contradicted(repo_path, kind, target)
+            _log(f"[{label}] DELETE: {target}")
+        elif action == "NONE" and target:
+            gm.stamp_used(repo_path, kind, target)
+            _log(f"[{label}] NONE: {target}")
+        else:
+            _log(f"[{label}] skipped unusable decision: {str(d)[:80]}")
+
+
+def consolidate(repo_path: str, transcript: str):
     """
-    Full consolidation cycle:
-    1. Extract user facts
-    2. Extract agent adaptations
-    3. A.U.D.N. cycle for each
-    4. Write/update memory files
-    5. Rebuild indexes
-    Git add/commit runs at the end.
-
-    Uses a per-user file lock to prevent concurrent consolidations from racing.
+    Full consolidation cycle, under the repo lock (the one lock every writer uses):
+    1. Extract user facts and agent adaptations (raises LLMError on failure, before
+       anything is written)
+    2. A.U.D.N. against the relevant existing memories, for each
+    3. Regenerate the SOUL.md / USER.md index blocks
+    4. Git commit + push
     """
-    with _UserLock(repo_path):
-        _consolidate_inner(repo_path, transcript, creds)
+    with gitops.repo_lock(repo_path):
+        _consolidate_inner(repo_path, transcript)
 
 
-def _consolidate_inner(repo_path: str, transcript: str, creds: dict | None = None):
-    """Inner consolidation logic, called under lock."""
+def _consolidate_inner(repo_path: str, transcript: str):
     today = date.today().strftime("%d.%m.%y")
 
-    # --- Step 1: User fact extraction ---
     _log("[consolidate] extracting user facts...")
-    raw = call_llm(USER_EXTRACTION_PROMPT, f"TRANSCRIPT:\n{transcript}", creds)
-    user_facts = parse_json(raw).get("facts", [])
+    user_facts = _items(call_llm(USER_EXTRACTION_PROMPT, f"TRANSCRIPT:\n{transcript}"), "facts")
     _log(f"[consolidate] got {len(user_facts)} user facts")
 
-    # --- Step 2: Agent adaptation extraction ---
     _log("[consolidate] extracting agent adaptations...")
-    raw = call_llm(AGENT_EXTRACTION_PROMPT, f"TRANSCRIPT:\n{transcript}", creds)
-    agent_facts = parse_json(raw).get("facts", [])
+    agent_facts = _items(call_llm(AGENT_EXTRACTION_PROMPT, f"TRANSCRIPT:\n{transcript}"), "facts")
     _log(f"[consolidate] got {len(agent_facts)} agent facts")
 
-    # --- Step 3+4: A.U.D.N. for user memories ---
-    if user_facts:
-        existing = load_existing_memories(repo_path, "USER_memory")
+    _apply(repo_path, "USER", "user", user_facts, today)
+    _apply(repo_path, "SOUL", "agent", agent_facts, today)
 
-        if not existing:
-            # No existing memories — skip AUDN, ADD everything directly
-            _log("[user] empty memory — adding all facts directly")
-            seen_slugs: set[str] = set()
-            for f in user_facts:
-                slug = f.get("slug", "")
-                if slug:
-                    pinned = bool(f.get("pinned"))
-                    write_memory_file(repo_path, "USER_memory", slug, f.get("fact", ""),
-                                      f.get("episode", f"Session {today}"), seen_slugs, pinned=pinned)
-                    _log(f"[user] ADD: {slug}{' (pinned)' if pinned or should_pin(f.get('fact', '')) else ''}")
-        else:
-            existing_text = format_existing_for_prompt(existing)
-            new_text = json.dumps(user_facts, indent=2)
+    try:  # the generated index blocks; a failure here must not lose the commit below
+        mem = Memory(repo_path)
+        try:
+            mem.write_indexes()
+        finally:
+            mem.close()
+    except Exception as e:  # noqa: BLE001
+        _log(f"[index] could not regenerate index blocks: {e}")
 
-            prompt = AUDN_PROMPT.replace("__EXISTING__", existing_text).replace("__NEW_FACTS__", new_text)
-            raw = call_llm(prompt, "Decide what to do with each new fact.", creds)
-            decisions = parse_json(raw).get("decisions", [])
-
-            seen_slugs: set[str] = set()
-            for d in decisions:
-                action = d.get("action", "").upper()
-                slug = d.get("slug", "")
-                fact = d.get("fact", "")
-                episode = d.get("episode", f"Session {today}")
-
-                if action == "ADD" and slug:
-                    pinned = bool(d.get("pinned"))
-                    write_memory_file(repo_path, "USER_memory", slug, fact, episode, seen_slugs, pinned=pinned)
-                    _log(f"[user] ADD: {slug}{' (pinned)' if pinned or should_pin(fact) else ''}")
-                elif action == "UPDATE" and d.get("target_slug"):
-                    target = _safe_slug(d["target_slug"])
-                    update_memory_file(repo_path, "USER_memory", target, fact, episode)
-                    _log(f"[user] UPDATE: {target}")
-                elif action == "DELETE" and d.get("target_slug"):
-                    target = _safe_slug(d["target_slug"])
-                    mark_contradicted(repo_path, "USER_memory", target)
-                    _log(f"[user] DELETE: {target}")
-                elif action == "NONE" and d.get("target_slug"):
-                    target = _safe_slug(d["target_slug"])
-                    mem_file = Path(repo_path) / "USER_memory" / f"{target}.md"
-                    if mem_file.exists():
-                        content = mem_file.read_text(encoding="utf-8")
-                        mem_file.write_text(_stamp_used(content, today), encoding="utf-8")
-                    _log(f"[user] NONE: {d['target_slug']}")
-
-    # --- Step 3+4: A.U.D.N. for agent memories ---
-    if agent_facts:
-        existing = load_existing_memories(repo_path, "SOUL_memory")
-
-        if not existing:
-            _log("[agent] empty memory — adding all facts directly")
-            seen_slugs: set[str] = set()
-            for f in agent_facts:
-                slug = f.get("slug", "")
-                if slug:
-                    pinned = bool(f.get("pinned"))
-                    write_memory_file(repo_path, "SOUL_memory", slug, f.get("fact", ""),
-                                      f.get("episode", f"Session {today}"), seen_slugs, pinned=pinned)
-                    _log(f"[agent] ADD: {slug}{' (pinned)' if pinned or should_pin(f.get('fact', '')) else ''}")
-        else:
-            existing_text = format_existing_for_prompt(existing)
-            new_text = json.dumps(agent_facts, indent=2)
-
-            prompt = AUDN_PROMPT.replace("__EXISTING__", existing_text).replace("__NEW_FACTS__", new_text)
-            raw = call_llm(prompt, "Decide what to do with each new fact.", creds)
-            decisions = parse_json(raw).get("decisions", [])
-
-            seen_slugs: set[str] = set()
-            for d in decisions:
-                action = d.get("action", "").upper()
-                slug = d.get("slug", "")
-                fact = d.get("fact", "")
-                episode = d.get("episode", f"Session {today}")
-
-                if action == "ADD" and slug:
-                    pinned = bool(d.get("pinned"))
-                    write_memory_file(repo_path, "SOUL_memory", slug, fact, episode, seen_slugs, pinned=pinned)
-                    _log(f"[agent] ADD: {slug}{' (pinned)' if pinned or should_pin(fact) else ''}")
-                elif action == "UPDATE" and d.get("target_slug"):
-                    target = _safe_slug(d["target_slug"])
-                    update_memory_file(repo_path, "SOUL_memory", target, fact, episode)
-                    _log(f"[agent] UPDATE: {target}")
-                elif action == "DELETE" and d.get("target_slug"):
-                    target = _safe_slug(d["target_slug"])
-                    mark_contradicted(repo_path, "SOUL_memory", target)
-                    _log(f"[agent] DELETE: {target}")
-                elif action == "NONE" and d.get("target_slug"):
-                    target = _safe_slug(d["target_slug"])
-                    mem_file = Path(repo_path) / "SOUL_memory" / f"{target}.md"
-                    if mem_file.exists():
-                        content = mem_file.read_text(encoding="utf-8")
-                        mem_file.write_text(_stamp_used(content, today), encoding="utf-8")
-                    _log(f"[agent] NONE: {d['target_slug']}")
-
-    # --- Step 5: Git commit ---
     git_commit(repo_path)
 
 
@@ -977,19 +601,19 @@ def main():
         transcript = read_transcript(transcript_path)
         if not transcript:
             _log("[error] empty transcript")
+            Path(transcript_path).unlink(missing_ok=True)
             sys.exit(1)
 
         try:
             consolidate(repo_path, transcript)
-        finally:
-            # Clean up the temp transcript on failure too — it lives INSIDE the
-            # repo, so a leftover is committed (and mirror-pushed) by the next
-            # consolidation's `git add -A` on any repo without the template's
-            # .gitignore. Raw chat history is exactly what must not leak there.
-            try:
-                Path(transcript_path).unlink(missing_ok=True)
-            except OSError:
-                pass
+        except LLMError as e:
+            # Keep the transcript: it is the only copy of the conversation, and
+            # re-running this command on it is the retry.
+            _log(f"[error] consolidation failed, transcript kept at {transcript_path}: {e}")
+            sys.exit(2)
+        # Success only. The transcript lives INSIDE the repo (gitignored by the
+        # template); raw chat history must not outlive a successful run.
+        Path(transcript_path).unlink(missing_ok=True)
 
     elif cmd == "--test":
         repo_path = sys.argv[2]
@@ -1008,7 +632,11 @@ def main():
         ])
 
         _log("[test] running consolidation with fake transcript...")
-        consolidate(repo_path, fake_transcript)
+        try:
+            consolidate(repo_path, fake_transcript)
+        except LLMError as e:
+            _log(f"[error] {e}")
+            sys.exit(2)
         _log("[test] done — check the repo for results")
 
     else:
