@@ -125,7 +125,7 @@ USER_EXTRACTION_PROMPT = dedent("""\
       after 6 months apart? If no, skip it.
     - Always second person: "you like coffee". One plain sentence, under 200
       characters, in the language the user used for it.
-    - Max 8 facts per extraction.
+    - Max 15 facts per extraction.
     - If a fact is safety-critical (allergy, medical condition, medication,
       emergency contact) or identity-defining (legal name, nationality, native
       language), set "pinned": true in the output. Otherwise omit or set false.
