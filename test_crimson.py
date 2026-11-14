@@ -186,6 +186,27 @@ def test_busy():
     check("free again afterwards", "busy" not in post("/v1/recall", uid, query="tea")[1])
 
 
+def test_recall_during_consolidation():
+    print("\n--- recall is answered while a consolidation waits on the LLM ---")
+    uid = "u1:c1:lobby"
+    seen = []
+
+    def fake_llm(system, user):  # every LLM call of the consolidation asks for a recall meanwhile
+        seen.append(post("/v1/recall", uid, query="tea")[1])
+        if "memory manager" in system:
+            return json.dumps({"decisions": []})
+        return json.dumps({"facts": [{"slug": "likes-jazz", "fact": "You like jazz."}]})
+
+    real, mh.call_llm = mh.call_llm, fake_llm
+    try:
+        mh.consolidate(str(S.repo_dir(uid)), "USER: I like jazz")
+    finally:
+        mh.call_llm = real
+    check("extraction and A.U.D.N. calls all happened", len(seen) >= 3, str(len(seen)))
+    check("no recall was busy, each got the memories",
+          all("busy" not in b and [r["id"] for r in b["user"]] == ["likes-tea"] for b in seen), str(seen))
+
+
 def test_delete():
     print("\n--- hard delete ---")
     uid = "u2:c1:lobby"
@@ -298,6 +319,7 @@ def main():
     try:
         test_recall_and_list()
         test_busy()
+        test_recall_during_consolidation()
         test_delete()
         test_forget()
         test_forget_sticks()

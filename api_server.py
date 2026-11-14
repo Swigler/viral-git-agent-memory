@@ -881,8 +881,9 @@ class ChatHandler(http.server.BaseHTTPRequestHandler):
     def _read_rows(self, user_id: str, rows) -> dict:
         """Read-only view of an existing repo: rows(memory) -> {"user": [...], "soul": [...]}.
 
-        Never creates a repo or a per-user chat state, and never waits behind a running
-        consolidation: a held repo lock gives {"user": [], "soul": [], "busy": true}.
+        Never creates a repo or a per-user chat state, and never waits: a held repo lock
+        gives {"user": [], "soul": [], "busy": true}. A consolidation holds that lock only
+        for its file reads and its final write (milliseconds), not during its LLM calls.
         """
         repo = repo_dir(user_id)
         empty = {"user": [], "soul": []}
@@ -993,7 +994,9 @@ class ChatHandler(http.server.BaseHTTPRequestHandler):
             evict_user(user_id)  # state, timer and its open sqlite connection
             try:
                 if repo.is_dir():
-                    with repo_lock(repo):  # waits for a running consolidation
+                    # A running consolidation holds this lock only while it reads or writes;
+                    # it finds its transcript gone afterwards and writes nothing.
+                    with repo_lock(repo):
                         shutil.rmtree(repo)
                     forgotten = True
             except FileNotFoundError:  # a concurrent forget got there first

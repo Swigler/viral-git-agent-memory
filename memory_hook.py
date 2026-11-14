@@ -70,6 +70,7 @@ from gitops import (  # noqa: F401
 )
 
 TEMPLATE_DIR = Path(__file__).parent / "template"
+QUEUE_LOCK_FILE = ".consolidation.lock"  # one consolidation per repo at a time (gitignored by the template)
 
 # --- LLM Provider Config ---
 LLM_PROVIDER = os.environ.get("MEMORY_LLM_PROVIDER", "").lower()
@@ -111,6 +112,10 @@ USER_EXTRACTION_PROMPT = dedent("""\
     - One-off scene actions, moment-to-moment narration, greetings, farewells.
     - What the user just asked or is doing right now.
     - Anything the character said about itself.
+    - Anything only the character said, guessed or assumed about the user. A fact
+      counts only when the user stated it or clearly confirmed it themselves.
+    - A question the user asked is not a fact ("what am I allergic to?" states
+      nothing about allergies).
     - A real third person's private details, beyond what the user said in passing
       as context.
     - Anything not stated: never infer.
@@ -508,12 +513,18 @@ def _fact(item, today: str) -> dict | None:
     }
 
 
-def _apply(repo_path: str, kind: str, label: str, facts: list, today: str):
-    """The A.U.D.N. step for one memory kind (USER or SOUL)."""
+def _decide(repo_path: str, kind: str, label: str, facts: list, today: str) -> tuple[list, set]:
+    """The A.U.D.N. decisions for one memory kind (USER or SOUL), nothing written yet.
+
+    Returns (decisions, slugs the model was shown). The repo lock is held only to read
+    the existing memories, not during the LLM call, so recall stays available.
+    """
     facts = [f for f in (_fact(i, today) for i in facts) if f and f["fact"]]
     if not facts:
-        return
-    existing = relevant_memories(repo_path, kind, facts)
+        return [], set()
+    with gitops.repo_lock(repo_path):
+        existing = relevant_memories(repo_path, kind, facts)
+    shown = {m["slug"] for m in existing}
     if existing:
         raw = call_llm(
             build_audn_prompt(format_existing_for_prompt(existing), json.dumps(
@@ -524,13 +535,20 @@ def _apply(repo_path: str, kind: str, label: str, facts: list, today: str):
     else:
         _log(f"[{label}] empty memory — adding all facts directly")
         decisions = [{**f, "action": "ADD"} for f in facts]
+    return decisions, shown
 
+
+def _write(repo_path: str, kind: str, label: str, decisions: list, shown: set):
+    """Apply the A.U.D.N. decisions of one memory kind. Caller holds the repo lock."""
     seen_slugs: set[str] = set()
     for d in decisions:
         action = str(d.get("action", "")).upper()
         target = d.get("target_slug")
         target = _safe_slug(target) if isinstance(target, str) and target.strip() else ""
-        if action == "ADD" and d["fact"]:
+        if target in shown and not gm._file(repo_path, kind, target).exists():
+            # it existed when the model decided and is gone now: the user deleted it meanwhile
+            _log(f"[{label}] skipped {action} of deleted memory: {target}")
+        elif action == "ADD" and d["fact"]:
             slug = gm.create(repo_path, kind, d["slug"], d["fact"], d["episode"],
                              d["pinned"] or should_pin(d["fact"]), seen_slugs)
             _log(f"[{label}] ADD: {slug}")
@@ -549,46 +567,56 @@ def _apply(repo_path: str, kind: str, label: str, facts: list, today: str):
 
 def consolidate(repo_path: str, transcript: str, transcript_path: str | None = None):
     """
-    Full consolidation cycle, under the repo lock (the one lock every writer uses):
+    Full consolidation cycle:
     1. Extract user facts and agent adaptations (raises LLMError on failure, before
        anything is written)
     2. A.U.D.N. against the relevant existing memories, for each
     3. Regenerate the SOUL.md / USER.md index blocks
     4. Git commit + push
-    If `transcript_path` is given and the file vanished while we waited for the lock
-    (the user was forgotten), nothing is written: a forget must stick.
+    Consolidations of one repo run one at a time (the queue lock). The repo lock, the
+    one recall / delete / forget also take, is held only to read the existing memories
+    and to write the result, never during an LLM call: recall is not answered "busy"
+    for the seconds a consolidation takes.
+    If `transcript_path` is given and the file vanished meanwhile (the user was
+    forgotten), nothing is written: a forget must stick.
     """
-    with gitops.repo_lock(repo_path):
-        if transcript_path and not Path(transcript_path).is_file():
-            _log("[skip] transcript vanished while waiting for the repo lock")
+    def gone() -> bool:
+        return bool(transcript_path) and not Path(transcript_path).is_file()
+
+    with gitops.repo_lock(repo_path, name=QUEUE_LOCK_FILE):
+        if gone():
+            _log("[skip] transcript vanished while waiting in the consolidation queue")
             return
-        _consolidate_inner(repo_path, transcript)
+        today = date.today().strftime("%d.%m.%y")
 
+        _log("[consolidate] extracting user facts...")
+        user_facts = _items(call_llm(USER_EXTRACTION_PROMPT, f"TRANSCRIPT:\n{transcript}"), "facts")
+        _log(f"[consolidate] got {len(user_facts)} user facts")
 
-def _consolidate_inner(repo_path: str, transcript: str):
-    today = date.today().strftime("%d.%m.%y")
+        _log("[consolidate] extracting agent adaptations...")
+        agent_facts = _items(call_llm(AGENT_EXTRACTION_PROMPT, f"TRANSCRIPT:\n{transcript}"), "facts")
+        _log(f"[consolidate] got {len(agent_facts)} agent facts")
 
-    _log("[consolidate] extracting user facts...")
-    user_facts = _items(call_llm(USER_EXTRACTION_PROMPT, f"TRANSCRIPT:\n{transcript}"), "facts")
-    _log(f"[consolidate] got {len(user_facts)} user facts")
+        user = _decide(repo_path, "USER", "user", user_facts, today)
+        soul = _decide(repo_path, "SOUL", "agent", agent_facts, today)
 
-    _log("[consolidate] extracting agent adaptations...")
-    agent_facts = _items(call_llm(AGENT_EXTRACTION_PROMPT, f"TRANSCRIPT:\n{transcript}"), "facts")
-    _log(f"[consolidate] got {len(agent_facts)} agent facts")
+        with gitops.repo_lock(repo_path):
+            if gone():
+                _log("[skip] transcript vanished during consolidation (forgotten)")
+                return
+            _write(repo_path, "USER", "user", *user)
+            _write(repo_path, "SOUL", "agent", *soul)
 
-    _apply(repo_path, "USER", "user", user_facts, today)
-    _apply(repo_path, "SOUL", "agent", agent_facts, today)
+            try:  # the generated index blocks; a failure here must not lose the commit below
+                mem = Memory(repo_path)
+                try:
+                    mem.write_indexes()
+                finally:
+                    mem.close()
+            except Exception as e:  # noqa: BLE001
+                _log(f"[index] could not regenerate index blocks: {e}")
 
-    try:  # the generated index blocks; a failure here must not lose the commit below
-        mem = Memory(repo_path)
-        try:
-            mem.write_indexes()
-        finally:
-            mem.close()
-    except Exception as e:  # noqa: BLE001
-        _log(f"[index] could not regenerate index blocks: {e}")
-
-    git_commit(repo_path)
+            git_commit(repo_path)
 
 
 # --- CLI ---

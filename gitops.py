@@ -48,15 +48,16 @@ _locks_guard = threading.Lock()
 
 
 @contextmanager
-def repo_lock(repo, blocking: bool = True):
+def repo_lock(repo, blocking: bool = True, name: str = LOCK_FILE):
     """Exclusive per-repo lock: flock between processes, RLock between threads.
 
     Re-entrant within a thread, so a locked consolidation can call Memory methods
     that lock again. The one lock file for every writer of the repo.
     `blocking=False` raises BlockingIOError at once if another thread or process holds it.
+    `name` picks another lock file in the repo (the consolidation queue, see memory_hook).
     ponytail: one small RLock per repo path is kept for the process lifetime.
     """
-    path = str(Path(repo) / LOCK_FILE)
+    path = str(Path(repo) / name)
     with _locks_guard:
         entry = _locks.setdefault(path, {"rlock": threading.RLock(), "fh": None, "depth": 0})
     if not entry["rlock"].acquire(blocking=blocking):
