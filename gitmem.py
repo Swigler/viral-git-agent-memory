@@ -795,9 +795,28 @@ class Memory:
         )
         return [self._hit(r) for r in rows]
 
-    @_locked
     def recall(self, memory_type: str, query: str = "", n: int = DEFAULT_N) -> str:
-        """The "- fact" block for the prompt, relevance-ranked.
+        """The "- fact" block for the prompt (see recall_rows for the ranking)."""
+        return "\n".join(f"- {h['fact']}" for h in self.recall_rows(memory_type, query, n))
+
+    @_locked
+    def listing(self, memory_type: str) -> list:
+        """Every non-contradicted memory as [{slug, fact, pinned, mtime}], newest first."""
+        rows = self.db.execute(
+            "SELECT slug, fact, pinned, mtime FROM memories WHERE memory_type = ? "
+            "AND contradicted = 0 ORDER BY mtime DESC, slug", (check_type(memory_type),))
+        return [{"slug": s, "fact": f, "pinned": bool(p), "mtime": m} for s, f, p, m in rows]
+
+    @_locked
+    def vacuum(self):
+        """Rewrite the sqlite file and truncate its WAL, so deleted text leaves the index file."""
+        self.db.execute("PRAGMA wal_checkpoint(TRUNCATE)")
+        self.db.execute("VACUUM")
+        self.db.execute("PRAGMA wal_checkpoint(TRUNCATE)")
+
+    @_locked
+    def recall_rows(self, memory_type: str, query: str = "", n: int = DEFAULT_N) -> list:
+        """The memories recall() formats, as hit dicts, relevance-ranked.
 
         Pinned memories lead — they are the ones marked as always-load, and a keyword
         query must not push them out — but at most n//2 of them, so a pile of pins
@@ -825,7 +844,7 @@ class Memory:
             chosen.append(hit)
             if len(chosen) >= n:
                 break
-        return "\n".join(f"- {h['fact']}" for h in chosen)
+        return chosen
 
     @_locked
     def _pinned(self, memory_type: str) -> list:

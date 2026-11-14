@@ -14,7 +14,7 @@ Trigger: every 30 messages, /bye, or 10 min inactivity (the server spawns this a
 background process), or run it by hand on a saved transcript.
 LLM: OpenAI-compatible (OpenAI, DeepSeek, etc.), Anthropic (Claude), or Ollama — user picks via env vars.
 Output: markdown files in a memory repo. A failed LLM call raises, exits non-zero and
-KEEPS the transcript so the run can be retried.
+DELETES the transcript (chat text must not stay on disk; that batch is lost).
 
 POSIX only (the repo lock is fcntl.flock). Stdlib only.
 
@@ -92,32 +92,38 @@ OLLAMA_MODEL = os.environ.get("OLLAMA_MODEL", "qwen3.5:4b")
 
 USER_EXTRACTION_PROMPT = dedent("""\
     You are a memory extraction assistant. Extract durable facts about the USER
-    from this conversation. Only extract from USER messages.
+    from this chat between an adult user and a companion character. Only extract
+    from USER messages.
+
+    Keep:
+    - Facts about the user: name, age, job, where they live, family, pets,
+      likes/dislikes, habits, important dates, plans, life events.
+    - The user's stated preferences and boundaries in the relationship: what they
+      like to be called, what they want and do not want.
+    - Lasting facts the user established about the shared story or relationship
+      ("you two agreed she is your girlfriend", "your anniversary is in May").
+    - Personal numbers (age, dates, how many kids) are fine.
+    - A fact the user states in character as fiction about themselves (e.g. "I am a
+      dragon") only if they set it as a lasting premise of the story, worded as
+      such: "In your story, you play a dragon."
+
+    NEVER extract:
+    - One-off scene actions, moment-to-moment narration, greetings, farewells.
+    - What the user just asked or is doing right now.
+    - Anything the character said about itself.
+    - A real third person's private details, beyond what the user said in passing
+      as context.
+    - Anything not stated: never infer.
 
     Rules:
-    - Durable facts ONLY: name, job, family, preferences, habits, life events.
-    - The 6-month test: would knowing this make the agent seem like it knows them
-      after 6 months of not talking? If no, skip it.
-    - Always second person: "you like coffee", not "he likes coffee".
-    - Numbers (gold, credits, prices) are EXCLUDED — they live in state, not memory.
+    - The 6-month test: would knowing this make the character seem to know the user
+      after 6 months apart? If no, skip it.
+    - Always second person: "you like coffee". One plain sentence, under 200
+      characters, in the language the user used for it.
     - Max 8 facts per extraction.
     - If a fact is safety-critical (allergy, medical condition, medication,
       emergency contact) or identity-defining (legal name, nationality, native
       language), set "pinned": true in the output. Otherwise omit or set false.
-
-    NEVER extract these — they are transient, not durable:
-    - What the agent offered or suggested ("is being offered a date", "was shown X")
-    - Greetings, farewells, pleasantries ("just said hello", "said goodbye")
-    - Scene narration or roleplay actions ("is walking through the room")
-    - What the agent did or said — only extract from USER messages
-    - Current conversation flow ("is asking about X", "wants to know Y")
-    - Anything that describes THIS moment rather than a lasting trait
-
-    GOOD: "You work as a software engineer" — durable identity fact
-    GOOD: "You prefer bullet points over paragraphs" — lasting preference
-    BAD: "You are being offered a room upgrade" — transient agent action
-    BAD: "You asked about the menu" — current conversation, not durable
-    BAD: "You are talking to the assistant" — obvious, not a fact
 
     Output ONLY valid JSON:
     {"facts": [{"slug": "likes-coffee", "fact": "You enjoy specialty coffee, especially Ethiopian single origin.", "episode": "Session DD.MM.YY — you mentioned buying a bag from a local roaster."}, {"slug": "peanut-allergy", "fact": "You are severely allergic to peanuts.", "episode": "Session DD.MM.YY — you warned about this.", "pinned": true}]}
@@ -126,29 +132,40 @@ USER_EXTRACTION_PROMPT = dedent("""\
 """)
 
 AGENT_EXTRACTION_PROMPT = dedent("""\
-    You are a memory extraction assistant. Extract how the AGENT should adapt
-    for THIS specific user, based on the conversation dynamic.
+    You are a memory extraction assistant. Extract how the AGENT, a companion
+    character in a chat with an adult user, should be with THIS specific user,
+    based on the conversation and the dynamic between them.
 
-    Extract from AGENT messages and the interaction pattern:
-    - What tone/style works (formal, playful, terse, detailed)
-    - Nicknames, inside jokes, recurring references
-    - What makes the user engage more or disengage
-    - Preferred response format (bullet points, paragraphs, code-first)
+    Extract:
+    - Tone that works with this user (playful, tender, teasing, direct, slow).
+    - Pet names and nicknames, in both directions.
+    - Inside jokes and recurring references.
+    - Recurring story threads and the current state of the relationship.
+    - What the user enjoys or dislikes in how the character talks.
+    - Pacing and length preferences.
 
     Rules:
-    - Only adaptations that would make the agent better for THIS user.
-    - NOT generic observations ("user asks questions" — everyone does).
-    - The 6-month test: would applying this make the agent feel familiar?
+    - Only what would make the character better for THIS user.
+    - Never infer: only what the conversation shows or states.
+    - Do not restate plain facts of the user's life (name, age, job, home, family,
+      pets, tastes): those are stored separately. Only how the character should
+      behave, speak and continue the shared story.
+    - Refer to the user as "they"; never guess a gender.
+    - Never record a real third person's private details beyond what the user said
+      in passing as context.
+    - One plain sentence per fact, under 200 characters, in the language the user
+      used for it.
+    - The 6-month test: would applying this make the character feel familiar?
     - Max 6 facts per extraction.
 
     NEVER extract these:
     - Generic truths ("user sends messages", "user responds to replies")
-    - Scene narration or what happened in a roleplay moment
+    - One-off moments or what happened in a single scene
     - One-off requests that won't recur
     - Transient conversation state ("user is currently asking about X")
 
     Output ONLY valid JSON:
-    {"facts": [{"slug": "prefers-bullet-points", "fact": "He responds better to bullet points than paragraphs.", "episode": "Session DD.MM.YY — he started skipping long-form answers."}]}
+    {"facts": [{"slug": "likes-short-teasing", "fact": "They enjoy light teasing and short replies.", "episode": "Session DD.MM.YY — they asked for shorter, playful answers."}]}
 
     If no adaptations found, return: {"facts": []}
 """)
@@ -530,7 +547,7 @@ def _apply(repo_path: str, kind: str, label: str, facts: list, today: str):
             _log(f"[{label}] skipped unusable decision: {str(d)[:80]}")
 
 
-def consolidate(repo_path: str, transcript: str):
+def consolidate(repo_path: str, transcript: str, transcript_path: str | None = None):
     """
     Full consolidation cycle, under the repo lock (the one lock every writer uses):
     1. Extract user facts and agent adaptations (raises LLMError on failure, before
@@ -538,8 +555,13 @@ def consolidate(repo_path: str, transcript: str):
     2. A.U.D.N. against the relevant existing memories, for each
     3. Regenerate the SOUL.md / USER.md index blocks
     4. Git commit + push
+    If `transcript_path` is given and the file vanished while we waited for the lock
+    (the user was forgotten), nothing is written: a forget must stick.
     """
     with gitops.repo_lock(repo_path):
+        if transcript_path and not Path(transcript_path).is_file():
+            _log("[skip] transcript vanished while waiting for the repo lock")
+            return
         _consolidate_inner(repo_path, transcript)
 
 
@@ -597,6 +619,11 @@ def main():
             _log("[error] no transcript path provided")
             sys.exit(1)
 
+        if not Path(transcript_path).is_file():
+            # The transcript lives inside the repo: gone means the user was forgotten
+            # (or it was already consumed). Never init_repo here, that would resurrect them.
+            _log(f"[skip] transcript {transcript_path} is gone, nothing to consolidate")
+            return
         init_repo(repo_path, user_id)
         transcript = read_transcript(transcript_path)
         if not transcript:
@@ -605,12 +632,17 @@ def main():
             sys.exit(1)
 
         try:
-            consolidate(repo_path, transcript)
+            consolidate(repo_path, transcript, transcript_path)
         except LLMError as e:
-            # Keep the transcript: it is the only copy of the conversation, and
-            # re-running this command on it is the retry.
-            _log(f"[error] consolidation failed, transcript kept at {transcript_path}: {e}")
+            # Chat text must not sit on disk forever: the batch is lost (accepted).
+            _log(f"[error] consolidation failed, transcript deleted: {e}")
+            Path(transcript_path).unlink(missing_ok=True)
             sys.exit(2)
+        except FileNotFoundError:
+            if Path(transcript_path).is_file():
+                raise
+            _log("[skip] repo removed while waiting for the lock (forgotten)")
+            return
         # Success only. The transcript lives INSIDE the repo (gitignored by the
         # template); raw chat history must not outlive a successful run.
         Path(transcript_path).unlink(missing_ok=True)

@@ -48,20 +48,28 @@ _locks_guard = threading.Lock()
 
 
 @contextmanager
-def repo_lock(repo):
+def repo_lock(repo, blocking: bool = True):
     """Exclusive per-repo lock: flock between processes, RLock between threads.
 
     Re-entrant within a thread, so a locked consolidation can call Memory methods
     that lock again. The one lock file for every writer of the repo.
+    `blocking=False` raises BlockingIOError at once if another thread or process holds it.
     ponytail: one small RLock per repo path is kept for the process lifetime.
     """
     path = str(Path(repo) / LOCK_FILE)
     with _locks_guard:
         entry = _locks.setdefault(path, {"rlock": threading.RLock(), "fh": None, "depth": 0})
-    with entry["rlock"]:
+    if not entry["rlock"].acquire(blocking=blocking):
+        raise BlockingIOError(f"repo busy: {repo}")
+    try:
         if entry["depth"] == 0:
-            entry["fh"] = open(path, "w")
-            fcntl.flock(entry["fh"], fcntl.LOCK_EX)
+            fh = open(path, "w")
+            try:
+                fcntl.flock(fh, fcntl.LOCK_EX | (0 if blocking else fcntl.LOCK_NB))
+            except BaseException:
+                fh.close()
+                raise
+            entry["fh"] = fh
         entry["depth"] += 1
         try:
             yield
@@ -71,6 +79,18 @@ def repo_lock(repo):
                 fcntl.flock(entry["fh"], fcntl.LOCK_UN)
                 entry["fh"].close()
                 entry["fh"] = None
+    finally:
+        entry["rlock"].release()
+
+
+def purge_history(repo, message: str = "memory"):
+    """Drop all git history and re-commit the current files as ONE fresh commit, so text
+    deleted from the working tree is not recoverable from .git. Caller holds repo_lock.
+    Remotes and other .git config are gone afterwards (none are used for this deployment)."""
+    shutil.rmtree(Path(repo) / ".git")
+    run_git(repo, "init", "-q", check=True)
+    if commit_all(repo, message, allow_empty=True) == "failed":
+        raise GitError("purge: commit failed")
 
 
 def atomic_write(path, text: str, mode: int = 0o644):

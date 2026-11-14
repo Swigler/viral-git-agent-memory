@@ -8,18 +8,17 @@ viral-git-agent-memory — API Server
 
 The /v1/chat endpoint: streams LLM responses via SSE with per-user memory in the
 prompt, and triggers the consolidation hook (every 30 messages, /v1/bye, 10 min idle).
-GitHub integration: users connect their own GitHub account, memories auto-push to their private repo.
-
 Stdlib only, POSIX only (file locks).
 
 Endpoints:
-    POST /v1/chat          — stream a chat response (SSE)
-    POST /v1/bye           — end session, trigger consolidation
-    POST /v1/consolidate   — manual consolidation with transcript
-    POST /v1/git/setup     — connect GitHub (token + optional repo name)
-    POST /v1/git/update    — change GitHub connection (same as setup, idempotent)
-    GET  /v1/git/status    — check if GitHub is connected (?userId=xxx)
-    GET  /health           — server health check
+    POST /v1/chat            — stream a chat response (SSE)
+    POST /v1/bye             — end session, trigger consolidation
+    POST /v1/consolidate     — manual consolidation with transcript
+    POST /v1/recall          — {userId, query?, n?} -> ranked {user, soul} memories (read-only)
+    POST /v1/memories        — {userId} -> every {user, soul} memory with `updated`
+    POST /v1/memories/delete — {userId, kind, id} -> hard delete + purge git history
+    POST /v1/forget          — {userId} -> delete the user's whole repo
+    GET  /health             — server health check
 
 Usage:
     MEMORY_LLM_PROVIDER=openai OPENAI_API_KEY=sk-xxx python api_server.py
@@ -67,20 +66,20 @@ import ipaddress
 import json
 import os
 import re
+import shutil
 import subprocess
 import sys
 import tempfile
 import threading
-from datetime import datetime
+from datetime import datetime, timezone
 from pathlib import Path
 from socketserver import ThreadingMixIn
-from urllib.parse import parse_qs, urlparse
-import urllib.error
+from urllib.parse import urlparse
 import urllib.request
 
 # Git and GitHub-credential handling lives in gitops (shared with memory_hook), the
 # repo initializer in memory_hook.init_repo, the markdown format and search in gitmem.
-from gitmem import DEFAULT_N, INDEX_BEGIN, INDEX_END, Memory
+from gitmem import DEFAULT_N, INDEX_BEGIN, INDEX_END, Memory, safe_slug
 from gitops import (  # noqa: F401 — push_to_github/git_auth are public API (Swigler/memory-bot loop.py)
     GIT_CMD_TIMEOUT,
     GITHUB_REMOTE,
@@ -88,6 +87,7 @@ from gitops import (  # noqa: F401 — push_to_github/git_auth are public API (S
     commit_all,
     git_auth,
     load_git_credentials,
+    purge_history,
     push_github,
     push_to_github,
     repo_lock,
@@ -575,113 +575,6 @@ def consolidate_pending(user_id: str, repo: Path, state: dict, reset_history: bo
         raise
 
 
-# --- GitHub Integration ---
-
-
-def _github_api(endpoint: str, token: str, method: str = "GET", payload: dict | None = None) -> dict | None:
-    """Call GitHub API. Returns parsed JSON or None on error."""
-    url = f"https://api.github.com{endpoint}"
-    data = json.dumps(payload).encode() if payload else None
-    req = urllib.request.Request(
-        url,
-        data=data,
-        headers={
-            "Accept": "application/vnd.github+json",
-            "Authorization": f"Bearer {token}",
-            "X-GitHub-Api-Version": "2022-11-28",
-            **({"Content-Type": "application/json"} if data else {}),
-        },
-        method=method,
-    )
-    try:
-        with urllib.request.urlopen(req, timeout=30) as resp:
-            return json.loads(resp.read())
-    except urllib.error.HTTPError as e:
-        body = e.read().decode()
-        if e.code == 422:
-            # 422 = repo already exists, which is fine
-            try:
-                err = json.loads(body)
-                if any("already exists" in str(x) for x in err.get("errors", [])):
-                    return {"already_exists": True}
-            except json.JSONDecodeError:
-                pass
-        log(f"[github] {method} {endpoint} → {e.code}: {body[:200]}")
-        return None
-    except Exception as e:
-        log(f"[github] {method} {endpoint} → {e}")
-        return None
-
-
-REPO_NAME_RE = re.compile(r"^[A-Za-z0-9_.-]{1,100}$")
-
-
-def valid_repo_name(name) -> bool:
-    return (isinstance(name, str) and REPO_NAME_RE.match(name) is not None
-            and name not in (".", "..") and not name.endswith(".git"))
-
-
-def setup_github_remote(repo: Path, token: str, repo_name: str | None = None) -> dict:
-    """
-    Validate GitHub token, create private repo if needed, set as remote, initial push.
-    Returns {"ok": True, "repo_url": ...} or {"ok": False, "error": ...}.
-    """
-    repo_name = repo_name or "viral-git-agent-memory"
-    if not valid_repo_name(repo_name):
-        return {"ok": False, "error": "Invalid repoName (letters, digits, . _ - only)"}
-
-    # 1. Validate token — get GitHub username
-    user_info = _github_api("/user", token)
-    if not user_info or "login" not in user_info:
-        return {"ok": False, "error": "Invalid GitHub token — could not authenticate"}
-    gh_username = user_info["login"]
-
-    # 2. Create private repo (idempotent — 422 if exists)
-    create_result = _github_api("/user/repos", token, method="POST", payload={
-        "name": repo_name,
-        "private": True,
-        "auto_init": False,
-        "description": "Personal AI memory — viral-git-agent-memory",
-    })
-    if create_result is None:
-        return {"ok": False, "error": "Failed to create GitHub repo — check token permissions (needs 'repo' scope)"}
-
-    repo_url = f"https://github.com/{gh_username}/{repo_name}"
-    # No credentials in the URL — git_auth supplies them per command instead.
-    remote_url = f"https://x-access-token@github.com/{gh_username}/{repo_name}.git"
-
-    # 3. Set the remote and push, under the repo lock: a consolidation commit or push
-    # running at the same moment would otherwise race us on .git/index.lock.
-    try:
-        with repo_lock(repo):
-            have = run_git(repo, "remote").stdout.split()
-            run_git(repo, "remote", "set-url" if GITHUB_REMOTE in have else "add",
-                    GITHUB_REMOTE, remote_url, check=True)
-            if commit_all(repo, "init memory vault", allow_empty=True, log=log) == "failed":
-                return {"ok": False, "error": "Could not commit the memory repo — see server log"}
-            ok, err = push_github(repo, token)
-    except GitError as e:
-        return {"ok": False, "error": f"git failed during GitHub setup: {e}"}
-    except subprocess.TimeoutExpired:
-        return {"ok": False, "error": f"git timed out during GitHub setup (>{GIT_CMD_TIMEOUT}s) — try again"}
-    if not ok:
-        return {"ok": False, "error": f"Repo created but push failed: {err}"}
-
-    # 4. Save credentials. The token is kept (0600, gitignored) because every later
-    # consolidation has to authenticate a push without the user being there to retype
-    # it. It stays out of .git/config, out of argv and out of every response.
-    save_git_credentials(repo, {
-        "github_username": gh_username,
-        "repo_name": repo_name,
-        "repo_url": repo_url,
-        "configured_at": datetime.now().isoformat(),
-        "token": token,
-    })
-
-    log(f"[github] setup complete for {gh_username}/{repo_name}")
-    return {"ok": True, "repo_url": repo_url, "username": gh_username}
-
-
 # --- HTTP Handler ---
 
 
@@ -690,6 +583,7 @@ def setup_github_remote(repo: Path, token: str, repo_name: str | None = None) ->
 MAX_BODY_BYTES = 10 * 1024 * 1024
 MAX_TRANSCRIPT_MESSAGES = 2000
 MAX_MESSAGE_CHARS = 100_000
+MAX_RECALL_N = 20
 
 
 def _host_header_ok(host_header: str | None) -> bool:
@@ -698,8 +592,7 @@ def _host_header_ok(host_header: str | None) -> bool:
     Loopback is not authentication. A web page on evil.example can re-point its
     own hostname at 127.0.0.1; the browser then treats this server as
     same-origin, so no CORS or Content-Type rule applies, and the page can
-    drive every endpoint — including /v1/git/setup with the attacker's GitHub
-    token, which pushes the user's whole memory repo to the attacker. What the
+    drive every endpoint — including /v1/forget and /v1/memories. What the
     page cannot change is the Host header: it stays "evil.example". So a
     keyless server only answers to loopback names (plus ALLOWED_HOSTS). With
     API_KEY set the Bearer secret already covers this.
@@ -822,16 +715,16 @@ class ChatHandler(http.server.BaseHTTPRequestHandler):
         path = urlparse(self.path).path  # exact match: no query, no prefix tricks
         if path == "/health":
             return self._send_json(200, {"status": "ok"})
-        if path == "/v1/git/status":
-            return self._handle_git_status()
         self.send_error(404)
 
     POST_ROUTES = {
         "/v1/chat": "_handle_chat",
         "/v1/bye": "_handle_bye",
         "/v1/consolidate": "_handle_consolidate",
-        "/v1/git/setup": "_handle_git_setup",
-        "/v1/git/update": "_handle_git_setup",  # same logic — idempotent
+        "/v1/recall": "_handle_recall",
+        "/v1/memories": "_handle_memories",
+        "/v1/memories/delete": "_handle_memory_delete",
+        "/v1/forget": "_handle_forget",
     }
 
     def do_POST(self):
@@ -985,49 +878,132 @@ class ChatHandler(http.server.BaseHTTPRequestHandler):
         spawn_consolidation(user_id, get_user_repo(user_id), messages)
         self._send_json(200, {"status": "consolidating", "user_id": user_id, "messages": len(messages)})
 
-    def _handle_git_setup(self):
-        """Handle /v1/git/setup and /v1/git/update — connect user's memory to their GitHub."""
+    def _read_rows(self, user_id: str, rows) -> dict:
+        """Read-only view of an existing repo: rows(memory) -> {"user": [...], "soul": [...]}.
+
+        Never creates a repo or a per-user chat state, and never waits behind a running
+        consolidation: a held repo lock gives {"user": [], "soul": [], "busy": true}.
+        """
+        repo = repo_dir(user_id)
+        empty = {"user": [], "soul": []}
+        if not repo.is_dir():
+            return empty
+        try:
+            with repo_lock(repo, blocking=False):
+                memory = Memory(repo)
+                try:
+                    return rows(memory)
+                finally:
+                    memory.close()
+        except BlockingIOError:
+            return {**empty, "busy": True}
+        except FileNotFoundError:  # forgotten between the check and the open
+            return empty
+
+    def _handle_recall(self):
+        """Handle /v1/recall — ranked memories for a query, structured, read-only."""
         data = self._read_json_body()
         if data is None:
             return
         user_id = self._identify(data.get("userId"))
         if user_id is None:
             return
-        github_token = data.get("githubToken")
-        repo_name = data.get("repoName")  # optional
-        if not isinstance(github_token, str) or not github_token.strip():
-            self.send_error(400, "githubToken required")
+        query, n = data.get("query", ""), data.get("n", DEFAULT_N)
+        if not isinstance(query, str) or len(query) > MAX_MESSAGE_CHARS:
+            self.send_error(400, "query must be a string")
             return
-        if repo_name is not None and not valid_repo_name(repo_name):
-            self.send_error(400, "repoName must be a string of letters, digits, . _ -")
+        if isinstance(n, bool) or not isinstance(n, int) or not 1 <= n <= MAX_RECALL_N:
+            self.send_error(400, f"n must be an integer 1-{MAX_RECALL_N}")
             return
 
-        log(f"[git/setup] user={user_id}")
-        result = setup_github_remote(get_user_repo(user_id), github_token.strip(), repo_name)
-        self._send_json(200 if result["ok"] else 400, result)
+        def rows(memory: Memory) -> dict:
+            return {key: [{"id": h["slug"], "fact": h["fact"], "pinned": h["pinned"]}
+                          for h in memory.recall_rows(kind, query, n)]
+                    for key, kind in (("user", "USER"), ("soul", "SOUL"))}
 
-    def _handle_git_status(self):
-        """Handle GET /v1/git/status?userId=xxx — check if GitHub is connected."""
-        raw = parse_qs(urlparse(self.path).query).get("userId", [""])[0].strip()
-        user_id = self._identify(raw)
+        self._send_json(200, self._read_rows(user_id, rows))
+
+    def _handle_memories(self):
+        """Handle /v1/memories — every non-contradicted memory of the user."""
+        data = self._read_json_body()
+        if data is None:
+            return
+        user_id = self._identify(data.get("userId"))
         if user_id is None:
             return
 
+        def rows(memory: Memory) -> dict:
+            return {key: [{"id": r["slug"], "fact": r["fact"], "pinned": r["pinned"],
+                           "updated": datetime.fromtimestamp(r["mtime"], timezone.utc).isoformat(timespec="seconds")}
+                          for r in memory.listing(kind)]
+                    for key, kind in (("user", "USER"), ("soul", "SOUL"))}
+
+        self._send_json(200, self._read_rows(user_id, rows))
+
+    def _handle_memory_delete(self):
+        """Handle /v1/memories/delete — hard delete one memory and purge the git history."""
+        data = self._read_json_body()
+        if data is None:
+            return
+        user_id = self._identify(data.get("userId"))
+        if user_id is None:
+            return
+        kind, slug = data.get("kind"), data.get("id")
+        if kind not in ("USER", "SOUL"):
+            self.send_error(400, "kind must be USER or SOUL")
+            return
+        # Strict: only a slug that safe_slug leaves unchanged (no separators, no dots).
+        if not isinstance(slug, str) or slug != safe_slug(slug):
+            self.send_error(400, "id must be a memory slug")
+            return
         repo = repo_dir(user_id)
-        response = {"userId": user_id, "connected": False}
-        if repo.exists():
-            creds = load_git_credentials(repo)
-            if creds:
-                response["connected"] = True
-                for key in ("github_username", "repo_name", "repo_url", "configured_at"):
-                    response[key] = creds.get(key, "")
-                try:  # last push time from git log (any remote branch)
-                    result = run_git(repo, "log", "--remotes", "-1", "--format=%ci", timeout=10)
-                    if result.returncode == 0 and result.stdout.strip():
-                        response["last_push"] = result.stdout.strip()
-                except subprocess.TimeoutExpired:
-                    pass
-        self._send_json(200, response)
+        deleted = False
+        try:
+            if repo.is_dir():
+                with repo_lock(repo):
+                    memory = Memory(repo)
+                    try:
+                        deleted = memory.delete(kind, slug)
+                        if deleted:
+                            memory.write_indexes()
+                            memory.vacuum()  # the deleted text must leave the sqlite file too
+                    finally:
+                        memory.close()
+                    if deleted:
+                        purge_history(repo)
+        except FileNotFoundError:  # forgotten while we waited for the lock
+            deleted = False
+        except (GitError, subprocess.TimeoutExpired, OSError) as e:
+            log(f"[memories/delete] failed for {user_id}: {e}")
+            self.send_error(500, "delete failed")
+            return
+        self._send_json(200, {"deleted": deleted})
+
+    def _handle_forget(self):
+        """Handle /v1/forget — remove the user's whole repo and drop their in-RAM state."""
+        data = self._read_json_body()
+        if data is None:
+            return
+        user_id = self._identify(data.get("userId"))
+        if user_id is None:
+            return
+        repo = repo_dir(user_id)
+        forgotten = False
+        with _chat_lock(user_id):  # no chat or bye running while the repo goes away
+            evict_user(user_id)  # state, timer and its open sqlite connection
+            try:
+                if repo.is_dir():
+                    with repo_lock(repo):  # waits for a running consolidation
+                        shutil.rmtree(repo)
+                    forgotten = True
+            except FileNotFoundError:  # a concurrent forget got there first
+                pass
+            except OSError as e:
+                log(f"[forget] failed for {user_id}: {e}")
+                self.send_error(500, "forget failed")
+                return
+        log(f"[forget] user={user_id} forgotten={forgotten}")
+        self._send_json(200, {"forgotten": forgotten})
 
 
 class ThreadedHTTPServer(ThreadingMixIn, http.server.HTTPServer):
@@ -1106,7 +1082,7 @@ def main():
     if not auth_enabled() and not _is_loopback(HOST):
         print(
             f"ERROR: refusing to bind {HOST} without auth — every endpoint (chat,\n"
-            "consolidation, GitHub token setup) would be open to anyone who can reach\n"
+            "consolidation, forget) would be open to anyone who can reach\n"
             "this port. Set API_KEY_SECRET (or SINGLE_TENANT=1 with API_KEY), or use HOST=127.0.0.1.",
             file=sys.stderr,
         )

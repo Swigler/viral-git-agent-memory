@@ -7,7 +7,7 @@
 Ollama-compatible LLM (no network, no API key).
 
 Covers: userId validation and collision-free repo dirs, per-user auth (and the
-single-tenant flag), LLM failure keeps the transcript, contradicted memories excluded,
+single-tenant flag), LLM failure deletes the transcript, contradicted memories excluded,
 header injection stripped, history window / orphan turns / unconsolidated buffer,
 concurrent consolidation, repo-creation race, exact route matching, input validation.
 
@@ -118,7 +118,7 @@ def test_user_ids():
     check("missing userId -> 400", http("POST", "/v1/bye", {}, tok("x"))[0] == 400)
     check("slash in userId -> 400 (not folded into a_b)", http("POST", "/v1/bye", {"userId": "a/b"}, tok("a_b"))[0] == 400)
     check("userId must be a string", http("POST", "/v1/chat", {"userId": 7, "message": "hi"})[0] == 400)
-    check("status without userId -> 400", http("GET", "/v1/git/status", token=tok("x"))[0] == 400)
+    check("memories without userId -> 400", http("POST", "/v1/memories", {}, tok("x"))[0] == 400)
     legacy = S.MEMORY_DIR / "olduser"
     legacy.mkdir(parents=True)
     subprocess.run(["git", "init", "-q", str(legacy)], check=True)
@@ -129,16 +129,17 @@ def test_user_ids():
 
 def test_auth():
     print("\n--- per-user auth ---")
-    check("no token -> 401", http("GET", "/v1/git/status?userId=alice")[0] == 401)
-    check("own token -> 200", http("GET", "/v1/git/status?userId=alice", token=tok("alice"))[0] == 200)
+    check("no token -> 401", http("POST", "/v1/memories", {"userId": "alice"})[0] == 401)
+    check("own token -> 200", http("POST", "/v1/memories", {"userId": "alice"}, tok("alice"))[0] == 200)
     cross = tok("alice")
     for method, path, body in [
-        ("GET", "/v1/git/status?userId=bob", None),
+        ("POST", "/v1/memories", {"userId": "bob"}),
         ("POST", "/v1/chat", {"userId": "bob", "message": "hi"}),
         ("POST", "/v1/bye", {"userId": "bob"}),
         ("POST", "/v1/consolidate", {"userId": "bob", "transcript": []}),
-        ("POST", "/v1/git/setup", {"userId": "bob", "githubToken": "x"}),
-        ("POST", "/v1/git/update", {"userId": "bob", "githubToken": "x"}),
+        ("POST", "/v1/recall", {"userId": "bob", "query": "x"}),
+        ("POST", "/v1/memories/delete", {"userId": "bob", "kind": "USER", "id": "x"}),
+        ("POST", "/v1/forget", {"userId": "bob"}),
     ]:
         check(f"alice's token cannot {method} {path.split('?')[0]} as bob",
               http(method, path, body, token=cross)[0] == 401)
@@ -148,9 +149,9 @@ def test_auth():
     S.SINGLE_TENANT, S.API_KEY = True, "shared-key"
     try:
         check("single-tenant: shared key works for any user",
-              http("GET", "/v1/git/status?userId=bob", token="shared-key")[0] == 200)
+              http("POST", "/v1/memories", {"userId": "bob"}, token="shared-key")[0] == 200)
         check("single-tenant: per-user HMAC token no longer accepted",
-              http("GET", "/v1/git/status?userId=bob", token=tok("bob"))[0] == 401)
+              http("POST", "/v1/memories", {"userId": "bob"}, token=tok("bob"))[0] == 401)
     finally:
         S.SINGLE_TENANT, S.API_KEY = False, ""
     check("API_KEY alone is not an auth mode", S.token_ok("bob", "Bearer anything") is False)
@@ -214,20 +215,22 @@ def hook(repo, uid, transcript, url=LLM_URL):
 
 
 def test_llm_failure_keeps_transcript():
-    print("\n--- LLM failure keeps the transcript ---")
+    print("\n--- LLM failure deletes the transcript ---")
     repo = S.get_user_repo("failer")
     tr = repo / ".transcript_test.jsonl"
     tr.write_text(json.dumps({"message": {"role": "user", "content": "I like green tea"}}) + "\n")
     done = hook(repo, "failer", tr, url="http://127.0.0.1:9")
     check("dead LLM -> non-zero exit", done.returncode != 0, done.stderr[-200:])
-    check("dead LLM -> transcript kept", tr.exists())
+    check("dead LLM -> transcript deleted (no chat text left on disk)", not tr.exists())
     check("dead LLM -> no memories written", not list((repo / "USER_memory").glob("*.md")))
+    tr.write_text(json.dumps({"message": {"role": "user", "content": "I like green tea"}}) + "\n")
     LLM.fail = True
     done = hook(repo, "failer", tr)
     LLM.fail = False
-    check("LLM HTTP 500 -> non-zero exit, transcript kept", done.returncode != 0 and tr.exists())
+    check("LLM HTTP 500 -> non-zero exit, transcript deleted", done.returncode != 0 and not tr.exists())
+    tr.write_text(json.dumps({"message": {"role": "user", "content": "I like green tea"}}) + "\n")
     done = hook(repo, "failer", tr)
-    check("retry on the kept transcript succeeds", done.returncode == 0, done.stderr[-300:])
+    check("a fresh transcript succeeds", done.returncode == 0, done.stderr[-300:])
     check("success removes the transcript", not tr.exists())
     check("memory written", "green tea" in (repo / "USER_memory/likes-tea.md").read_text())
     check("index block regenerated in USER.md", "likes-tea" in (repo / "USER.md").read_text())
@@ -361,7 +364,7 @@ def test_routes_and_validation():
     st, body = http("GET", "/health?x=1")
     check("/health with a query string works and is minimal", st == 200 and json.loads(body) == {"status": "ok"}, body)
     check("/healthz is 404", http("GET", "/healthz")[0] == 404)
-    check("/v1/git/statusX is 404", http("GET", "/v1/git/statusX?userId=alice", token=tok("alice"))[0] == 404)
+    check("/v1/memoriesX is 404", http("POST", "/v1/memoriesX", {"userId": "alice"}, tok("alice"))[0] == 404)
     check("/v1/chatX is 404", http("POST", "/v1/chatX", {"userId": "alice", "message": "hi"}, tok("alice"))[0] == 404)
     check("/v1/chat/ is 404", http("POST", "/v1/chat/", {"userId": "alice", "message": "hi"}, tok("alice"))[0] == 404)
     check("query string does not break POST routing", http("POST", "/v1/bye?x=1", {"userId": "alice"}, tok("alice"))[0] == 200)
@@ -381,10 +384,6 @@ def test_routes_and_validation():
         check("empty transcript is a no-op", http("POST", "/v1/consolidate", {"userId": "alice", "transcript": []}, t)[0] == 200 and len(sent) == 1)
     finally:
         S.spawn_consolidation = real
-    for name in ("..", ".", "a/b", "x.git", "a b", 5):
-        check(f"repoName {name!r} rejected before any GitHub call",
-              http("POST", "/v1/git/setup", {"userId": "alice", "githubToken": "t", "repoName": name}, tok("alice"))[0] == 400)
-    check("githubToken required", http("POST", "/v1/git/setup", {"userId": "alice"}, tok("alice"))[0] == 400)
     check("non-JSON body -> 400", http("POST", "/v1/bye", raw=b"{nope", token=tok("alice"))[0] == 400)
     check("oversized message -> 413", http("POST", "/v1/chat", {"userId": "alice", "message": "x" * (S.MAX_MESSAGE_CHARS + 1)}, tok("alice"))[0] == 413)
 
